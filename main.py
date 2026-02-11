@@ -299,9 +299,13 @@ class LinkupExaSpringBot2026(ForecastBot):
             ),
         }
 
-        kwargs.setdefault("name", self.BOT_NAME)
+        # ForecastBot.__init__ does NOT accept name=; store locally instead.
         super().__init__(*args, **kwargs)
+        self.bot_name = self.BOT_NAME
 
+    # -----------------------------
+    # Prompt de-correlation variants
+    # -----------------------------
     def _variant_prefix(self, i: int) -> str:
         variants = [
             "Variant A (Outside view heavy): Start from base rates/reference classes and update cautiously.",
@@ -312,6 +316,9 @@ class LinkupExaSpringBot2026(ForecastBot):
         ]
         return variants[i % len(variants)]
 
+    # -----------------------------
+    # Numeric/date sanitization
+    # -----------------------------
     def _enforce_monotone_non_decreasing(self, xs: List[float]) -> List[float]:
         out: List[float] = []
         last: float | None = None
@@ -370,6 +377,9 @@ class LinkupExaSpringBot2026(ForecastBot):
 
         return [Percentile(percentile=plist[i].percentile, value=vals[i]) for i in range(len(plist))]
 
+    # -----------------------------
+    # Research (rank sources + top only)
+    # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             q = question.question_text.strip()
