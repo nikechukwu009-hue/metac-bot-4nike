@@ -7,14 +7,19 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
-from typing import Any, Dict, List, Literal, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import dotenv
 import httpx
 
 from forecasting_tools import (
+    BinaryPrediction,
     BinaryQuestion,
+    ConditionalPrediction,
+    ConditionalQuestion,
+    DatePercentile,
+    DateQuestion,
     ForecastBot,
     GeneralLlm,
     MetaculusClient,
@@ -22,15 +27,10 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    DateQuestion,
-    DatePercentile,
     Percentile,
-    ConditionalQuestion,
-    ConditionalPrediction,
-    PredictionTypes,
-    PredictionAffirmed,
-    BinaryPrediction,
     PredictedOptionList,
+    PredictionAffirmed,
+    PredictionTypes,
     ReasonedPrediction,
     clean_indents,
     structure_output,
@@ -91,20 +91,16 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 
 class PatchedMetaculusClient(MetaculusClient):
     """
-    Patch point: forecasting_tools parses Metaculus post JSON and asserts bounds are floats.
-    Some posts return ints for bounds. We coerce before DataOrganizer runs.
+    Patch point: forecasting_tools parses Metaculus post JSON and may assert bounds are floats.
+    Some posts return ints for bounds. We coerce, then defer to upstream logic (important for groups/lists).
     """
 
     def _post_json_to_questions_while_handling_groups(self, post_json_from_api, group_question_mode=None):
-        # Import here to avoid changing global import order
-        from forecasting_tools.data_models.data_organizer import DataOrganizer
-
         post_json_from_api = _coerce_int_bounds_to_float(post_json_from_api)
-
-        # The upstream code returns a list of questions; keep behavior aligned.
-        # post_json_from_api is typically a post JSON object or list-like depending on internal call path.
-        # In the crash trace, it was passed straight to DataOrganizer.get_question_from_post_json.
-        return [DataOrganizer.get_question_from_post_json(post_json_from_api)]
+        return super()._post_json_to_questions_while_handling_groups(
+            post_json_from_api,
+            group_question_mode=group_question_mode,
+        )
 
 
 @dataclass
@@ -115,8 +111,17 @@ class EvidenceSummary:
     sources: List[str]
 
 
+@dataclass
+class EvidenceSummaryOut:
+    # for structure_output parsing
+    direction: Literal["yes", "no", "unclear"]
+    strength: float
+    key_points: List[str]
+    sources: List[str]
+
+
 def _clamp01(x: float) -> float:
-    if x != x:
+    if x != x:  # NaN
         return 0.5
     return max(0.0, min(1.0, x))
 
@@ -138,53 +143,6 @@ def _median_merge_lists(values: List[float]) -> float:
     if not values:
         return 0.5
     return float(median(values))
-
-
-async def _post_json(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: Dict[str, str],
-    payload: Dict,
-) -> Dict:
-    r = await client.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_S)
-    r.raise_for_status()
-    return r.json()
-
-
-async def linkup_search(query: str, max_results: int = 8, depth: str = "deep") -> List[Dict]:
-    if not LINKUP_API_KEY:
-        return []
-    headers = {"Authorization": f"Bearer {LINKUP_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "q": query,
-        "depth": depth,
-        "outputType": "searchResults",
-        "includeSources": False,
-        "includeImages": False,
-        "includeInlineCitations": False,
-        "maxResults": max_results,
-    }
-    async with httpx.AsyncClient() as client:
-        data = await _post_json(client, LINKUP_ENDPOINT, headers, payload)
-    return data.get("results", []) or []
-
-
-async def exa_search(query: str, max_results: int = 8, max_age_hours: int | None = None) -> List[Dict]:
-    if not EXA_API_KEY:
-        return []
-    headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
-    payload: Dict[str, object] = {
-        "query": query,
-        "numResults": max_results,
-        "type": "auto",
-        "useAutoprompt": True,
-        "contents": {"highlights": {"max_characters": 2000}},
-    }
-    if max_age_hours is not None:
-        payload["maxAgeHours"] = int(max_age_hours)
-    async with httpx.AsyncClient() as client:
-        data = await _post_json(client, EXA_ENDPOINT, headers, payload)
-    return data.get("results", []) or []
 
 
 # -----------------------------
@@ -357,6 +315,59 @@ class LinkupExaSpringBot2026(ForecastBot):
         super().__init__(*args, **kwargs)
         self.bot_name = self.BOT_NAME
 
+        # Reuse one HTTP client to avoid connection churn
+        self._http = httpx.AsyncClient(timeout=HTTP_TIMEOUT_S)
+
+    async def aclose(self) -> None:
+        try:
+            await self._http.aclose()
+        except Exception:
+            pass
+
+    async def _post_json(self, url: str, headers: Dict[str, str], payload: Dict) -> Dict:
+        r = await self._http.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    async def _safe_search(self, coro):
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("Search failed: %s", e)
+            return []
+
+    async def linkup_search(self, query: str, max_results: int = 8, depth: str = "deep") -> List[Dict]:
+        if not LINKUP_API_KEY:
+            return []
+        headers = {"Authorization": f"Bearer {LINKUP_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "q": query,
+            "depth": depth,
+            "outputType": "searchResults",
+            "includeSources": False,
+            "includeImages": False,
+            "includeInlineCitations": False,
+            "maxResults": max_results,
+        }
+        data = await self._post_json(LINKUP_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+
+    async def exa_search(self, query: str, max_results: int = 8, max_age_hours: Optional[int] = None) -> List[Dict]:
+        if not EXA_API_KEY:
+            return []
+        headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
+        payload: Dict[str, object] = {
+            "query": query,
+            "numResults": max_results,
+            "type": "auto",
+            "useAutoprompt": True,
+            "contents": {"highlights": {"max_characters": 2000}},
+        }
+        if max_age_hours is not None:
+            payload["maxAgeHours"] = int(max_age_hours)
+        data = await self._post_json(EXA_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+
     # -----------------------------
     # Prompt de-correlation variants
     # -----------------------------
@@ -375,7 +386,7 @@ class LinkupExaSpringBot2026(ForecastBot):
     # -----------------------------
     def _enforce_monotone_non_decreasing(self, xs: List[float]) -> List[float]:
         out: List[float] = []
-        last: float | None = None
+        last: Optional[float] = None
         for x in xs:
             if last is None:
                 last = x
@@ -443,10 +454,10 @@ class LinkupExaSpringBot2026(ForecastBot):
             query_core = q
             query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
 
-            linkup_task1 = asyncio.create_task(linkup_search(query_core, max_results=8, depth="deep"))
-            linkup_task2 = asyncio.create_task(linkup_search(query_resolution, max_results=6, depth="deep"))
-            exa_task1 = asyncio.create_task(exa_search(query_core, max_results=10))
-            exa_task2 = asyncio.create_task(exa_search(query_resolution, max_results=8))
+            linkup_task1 = asyncio.create_task(self._safe_search(self.linkup_search(query_core, max_results=8, depth="deep")))
+            linkup_task2 = asyncio.create_task(self._safe_search(self.linkup_search(query_resolution, max_results=6, depth="deep")))
+            exa_task1 = asyncio.create_task(self._safe_search(self.exa_search(query_core, max_results=10)))
+            exa_task2 = asyncio.create_task(self._safe_search(self.exa_search(query_resolution, max_results=8)))
 
             linkup_1, linkup_2, exa_1, exa_2 = await asyncio.gather(
                 linkup_task1, linkup_task2, exa_task1, exa_task2, return_exceptions=False
@@ -526,14 +537,30 @@ class LinkupExaSpringBot2026(ForecastBot):
         )
         raw = await self.get_llm("default", "llm").invoke(prompt)
 
+        # Preferred: structured parsing (more robust than regex JSON extraction)
+        try:
+            parsed: EvidenceSummaryOut = await structure_output(
+                text_to_structure=raw,
+                output_type=EvidenceSummaryOut,  # type: ignore
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+            direction = parsed.direction if parsed.direction in ("yes", "no", "unclear") else "unclear"
+            strength = _clamp01(float(parsed.strength))
+            key_points = [str(x) for x in (parsed.key_points or [])][:6]
+            sources = [str(s).strip() for s in (parsed.sources or []) if str(s).strip()][:12]
+            return EvidenceSummary(direction=direction, strength=strength, key_points=key_points, sources=sources)
+        except Exception:
+            pass
+
+        # Fallback: regex JSON extraction
         try:
             m = re.search(r"\{.*\}", raw, flags=re.S)
             obj = json.loads(m.group(0) if m else raw)
             direction = obj.get("direction", "unclear")
             if direction not in ("yes", "no", "unclear"):
                 direction = "unclear"
-            strength = float(obj.get("strength", 0.0))
-            strength = _clamp01(strength)
+            strength = _clamp01(float(obj.get("strength", 0.0)))
             key_points = obj.get("key_points") or []
             if not isinstance(key_points, list):
                 key_points = [str(key_points)]
@@ -708,11 +735,15 @@ class LinkupExaSpringBot2026(ForecastBot):
         percentile_samples: List[List[Percentile]] = []
 
         if is_date:
+            # Keep this consistent with DatePercentile parsing by requiring an ISO datetime.
             parsing_instructions = clean_indents(
                 """
                 Parse a percentile distribution for a date question.
-                Dates must be parsed into valid datetimes. Assume midnight UTC if no time is given.
-                If percentiles are missing, indicate parsing failure rather than hallucinating.
+
+                IMPORTANT:
+                - Output dates as ISO datetimes: YYYY-MM-DDT00:00:00Z (midnight UTC).
+                - Do NOT output bare YYYY-MM-DD.
+                - If percentiles are missing/ambiguous, indicate parsing failure rather than hallucinating.
                 """
             )
         else:
@@ -874,7 +905,7 @@ class LinkupExaSpringBot2026(ForecastBot):
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        lower_bound_message, upper_bound_message = self._create_lower_and_upper_bound_messages(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster.
@@ -928,7 +959,7 @@ class LinkupExaSpringBot2026(ForecastBot):
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        lower_bound_message, upper_bound_message = self._create_lower_and_upper_bound_messages(question)
         prompt = clean_indents(
             f"""
             You are a professional forecaster.
@@ -956,7 +987,7 @@ class LinkupExaSpringBot2026(ForecastBot):
             {upper_bound_message}
 
             Date formatting:
-            - Use YYYY-MM-DD only (or YYYY-MM-DDTHH:MM:SSZ if needed).
+            - Use ISO datetime at midnight UTC: YYYY-MM-DDT00:00:00Z
             - Percentiles must be chronological increasing.
 
             Write:
@@ -966,19 +997,20 @@ class LinkupExaSpringBot2026(ForecastBot):
             (d) Low/high surprise scenarios.
 
             Final answer exactly:
-            Percentile 10: YYYY-MM-DD
-            Percentile 20: YYYY-MM-DD
-            Percentile 40: YYYY-MM-DD
-            Percentile 60: YYYY-MM-DD
-            Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD
+            Percentile 10: YYYY-MM-DDT00:00:00Z
+            Percentile 20: YYYY-MM-DDT00:00:00Z
+            Percentile 40: YYYY-MM-DDT00:00:00Z
+            Percentile 60: YYYY-MM-DDT00:00:00Z
+            Percentile 80: YYYY-MM-DDT00:00:00Z
+            Percentile 90: YYYY-MM-DDT00:00:00Z
             """
         )
         return await self._sample_median_numeric(question, prompt, is_date=True)
 
-    def _create_upper_and_lower_bound_messages(
+    def _create_lower_and_upper_bound_messages(
         self, question: Union[NumericQuestion, DateQuestion]
     ) -> Tuple[str, str]:
+        # Return (lower_message, upper_message) to match variable names and prevent order confusion.
         if isinstance(question, NumericQuestion):
             upper_bound_number = (
                 question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
@@ -1007,7 +1039,8 @@ class LinkupExaSpringBot2026(ForecastBot):
             )
         else:
             lower_bound_message = f"The outcome cannot be lower/earlier than {lower_bound_number} {unit_of_measure}."
-        return upper_bound_message, lower_bound_message
+
+        return lower_bound_message, upper_bound_message
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
@@ -1106,7 +1139,7 @@ if __name__ == "__main__":
         help="Specify the run mode (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode  # type: ignore
 
     bot = LinkupExaSpringBot2026(
         research_reports_per_question=1,
@@ -1121,23 +1154,30 @@ if __name__ == "__main__":
     # IMPORTANT: use patched client to coerce integer bounds -> float bounds
     client = PatchedMetaculusClient()
 
-    if run_mode == "tournament":
-        seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
-        minibench = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
-        market_pulse = asyncio.run(bot.forecast_on_tournament(MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True))
-        reports = seasonal + minibench + market_pulse
-    elif run_mode == "metaculus_cup":
-        bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
-    else:
-        EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-            "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
-        ]
-        bot.skip_previously_forecasted_questions = False
-        questions = [client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
-        reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+    try:
+        if run_mode == "tournament":
+            seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+            minibench = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+            market_pulse = asyncio.run(bot.forecast_on_tournament(MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True))
+            reports = seasonal + minibench + market_pulse
+        elif run_mode == "metaculus_cup":
+            bot.skip_previously_forecasted_questions = False
+            reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+        else:
+            EXAMPLE_QUESTIONS = [
+                "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+                "https://www.metaculus.com/questions/14333/age-of-oldest-human-as-of-2100/",
+                "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+                "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
+            ]
+            bot.skip_previously_forecasted_questions = False
+            questions = [client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
+            reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
 
-    bot.log_report_summary(reports)
+        bot.log_report_summary(reports)
+    finally:
+        # Close shared HTTP client cleanly
+        try:
+            asyncio.run(bot.aclose())
+        except Exception:
+            pass
