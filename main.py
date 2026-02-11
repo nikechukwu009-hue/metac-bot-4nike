@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
-from typing import Dict, List, Literal, Tuple, Union
+from typing import Any, Dict, List, Literal, Tuple, Union
 from urllib.parse import urlparse
 
 import dotenv
@@ -42,8 +42,7 @@ logger = logging.getLogger(__name__)
 # Precompiled whitespace normalizer (avoids backslashes inside f-string expressions)
 _WS_RE = re.compile(r"\s+")
 
-# Use OpenRouter's "openrouter/free" for ALL roles (forecaster, summarizer, parser).
-# OpenRouter will route to a free model as available.
+# Use OpenRouter's "openrouter/free" for ALL roles (forecaster, summarizer, parser, researcher).
 OPENROUTER_DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "openrouter/free")
 OPENROUTER_PARSER_MODEL = os.getenv("OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL)
 
@@ -57,6 +56,55 @@ HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 # Added tournament slug
 MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
+
+# Keys observed in Metaculus/forecasting_tools payloads that can carry numeric bounds
+_BOUND_KEYS = {
+    "upper_bound",
+    "lower_bound",
+    "nominal_upper_bound",
+    "nominal_lower_bound",
+    "upperBound",
+    "lowerBound",
+    "nominalUpperBound",
+    "nominalLowerBound",
+}
+
+
+def _coerce_int_bounds_to_float(obj: Any) -> Any:
+    """
+    Recursively walk dict/list payloads and convert int bounds into float bounds.
+    This prevents forecasting_tools assertions like: assert isinstance(upper_bound, float)
+    when the API returns e.g. 200 (int) instead of 200.0 (float).
+    """
+    if isinstance(obj, dict):
+        out: Dict[Any, Any] = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and k in _BOUND_KEYS and isinstance(v, int):
+                out[k] = float(v)
+            else:
+                out[k] = _coerce_int_bounds_to_float(v)
+        return out
+    if isinstance(obj, list):
+        return [_coerce_int_bounds_to_float(x) for x in obj]
+    return obj
+
+
+class PatchedMetaculusClient(MetaculusClient):
+    """
+    Patch point: forecasting_tools parses Metaculus post JSON and asserts bounds are floats.
+    Some posts return ints for bounds. We coerce before DataOrganizer runs.
+    """
+
+    def _post_json_to_questions_while_handling_groups(self, post_json_from_api, group_question_mode=None):
+        # Import here to avoid changing global import order
+        from forecasting_tools.data_models.data_organizer import DataOrganizer
+
+        post_json_from_api = _coerce_int_bounds_to_float(post_json_from_api)
+
+        # The upstream code returns a list of questions; keep behavior aligned.
+        # post_json_from_api is typically a post JSON object or list-like depending on internal call path.
+        # In the crash trace, it was passed straight to DataOrganizer.get_question_from_post_json.
+        return [DataOrganizer.get_question_from_post_json(post_json_from_api)]
 
 
 @dataclass
@@ -297,9 +345,15 @@ class LinkupExaSpringBot2026(ForecastBot):
                 timeout=60,
                 allowed_tries=2,
             ),
+            # IMPORTANT: forecasting_tools expects this purpose; otherwise it falls back to a search model.
+            "researcher": GeneralLlm(
+                model=OPENROUTER_DEFAULT_MODEL,
+                temperature=0.2,
+                timeout=60,
+                allowed_tries=2,
+            ),
         }
 
-        # ForecastBot.__init__ does NOT accept name=; store locally instead.
         super().__init__(*args, **kwargs)
         self.bot_name = self.BOT_NAME
 
@@ -1064,7 +1118,8 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
     )
 
-    client = MetaculusClient()
+    # IMPORTANT: use patched client to coerce integer bounds -> float bounds
+    client = PatchedMetaculusClient()
 
     if run_mode == "tournament":
         seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
