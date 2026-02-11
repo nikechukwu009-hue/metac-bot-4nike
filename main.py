@@ -442,7 +442,7 @@ class LinkupExaSpringBot2026(ForecastBot):
                 """
             ).strip()
 
-            logger.info(f"Found Research for URL {question.page_url}:\n{research_full}")
+            logger.info(f"Found Research for URL {getattr(question, 'page_url', '')}:\n{research_full}")
             return research_full
 
     async def _extract_evidence_summary(self, question: MetaculusQuestion, research: str) -> EvidenceSummary:
@@ -531,7 +531,9 @@ class LinkupExaSpringBot2026(ForecastBot):
                 out[k] = each
         return _softmax_normalize(out)
 
-    async def _sample_median_binary(self, question: BinaryQuestion, prompt: str, ev: EvidenceSummary) -> ReasonedPrediction[float]:
+    async def _sample_median_binary(
+        self, question: BinaryQuestion, prompt: str, ev: EvidenceSummary
+    ) -> ReasonedPrediction[float]:
         samples: List[float] = []
         reasonings: List[str] = []
         for i in range(self._fermi_samples):
@@ -549,6 +551,10 @@ class LinkupExaSpringBot2026(ForecastBot):
         p_med = _median_merge_lists(samples)
         p_final = self._maybe_extremize_binary(p_med, ev)
 
+        compressed_rationales = "\n".join(
+            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+        )
+
         combined_reasoning = clean_indents(
             f"""
             Bot name: {self.BOT_NAME}
@@ -565,11 +571,11 @@ class LinkupExaSpringBot2026(ForecastBot):
             Final probability (after evidence rule): {p_final:.3f}
 
             --- Model rationales (compressed) ---
-            {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])})
+            {compressed_rationales}
             """
-        .strip()
+        ).strip()
 
-        logger.info(f"Binary median samples for URL {question.page_url}: {samples} -> {p_final}")
+        logger.info(f"Binary median samples for URL {getattr(question, 'page_url', '')}: {samples} -> {p_final}")
         return ReasonedPrediction(prediction_value=p_final, reasoning=combined_reasoning)
 
     async def _sample_median_multichoice(
@@ -612,6 +618,10 @@ class LinkupExaSpringBot2026(ForecastBot):
         final_probs = self._maybe_extremize_multichoice(med_probs, ev)
         final_list = PredictedOptionList.from_dict(final_probs)
 
+        compressed_rationales = "\n".join(
+            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+        )
+
         combined_reasoning = clean_indents(
             f"""
             Bot name: {self.BOT_NAME}
@@ -629,11 +639,11 @@ class LinkupExaSpringBot2026(ForecastBot):
             {chr(10).join([f"{k}: {v:.4f}" for k, v in final_probs.items()])}
 
             --- Model rationales (compressed) ---
-            {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])}
+            {compressed_rationales}
             """
         ).strip()
 
-        logger.info(f"MC median for URL {question.page_url}: {final_probs}")
+        logger.info(f"MC median for URL {getattr(question, 'page_url', '')}: {final_probs}")
         return ReasonedPrediction(prediction_value=final_list, reasoning=combined_reasoning)
 
     async def _sample_median_numeric(
@@ -703,6 +713,10 @@ class LinkupExaSpringBot2026(ForecastBot):
         merged = self._sanitize_percentiles(question, merged, is_date=is_date)
         dist = NumericDistribution.from_question(merged, question)  # type: ignore
 
+        compressed_rationales = "\n".join(
+            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+        )
+
         combined_reasoning = clean_indents(
             f"""
             Bot name: {self.BOT_NAME}
@@ -711,11 +725,11 @@ class LinkupExaSpringBot2026(ForecastBot):
             {chr(10).join([f"P{int(p.percentile)}: {p.value}" for p in merged])}
 
             --- Model rationales (compressed) ---
-            {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])}
+            {compressed_rationales}
             """
         ).strip()
 
-        logger.info(f"Numeric/date median for URL {question.page_url}: {dist.declared_percentiles}")
+        logger.info(f"Numeric/date median for URL {getattr(question, 'page_url', '')}: {dist.declared_percentiles}")
         return ReasonedPrediction(prediction_value=dist, reasoning=combined_reasoning)
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
@@ -911,8 +925,12 @@ class LinkupExaSpringBot2026(ForecastBot):
         self, question: Union[NumericQuestion, DateQuestion]
     ) -> Tuple[str, str]:
         if isinstance(question, NumericQuestion):
-            upper_bound_number = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
-            lower_bound_number = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
+            upper_bound_number = (
+                question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
+            )
+            lower_bound_number = (
+                question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
+            )
             unit_of_measure = question.unit_of_measure or ""
         elif isinstance(question, DateQuestion):
             upper_bound_number = question.upper_bound.date().isoformat()
@@ -922,12 +940,16 @@ class LinkupExaSpringBot2026(ForecastBot):
             raise ValueError("Unsupported question type for bounds")
 
         if getattr(question, "open_upper_bound", False):
-            upper_bound_message = f"The question creator thinks the outcome is likely not higher/later than {upper_bound_number} {unit_of_measure}."
+            upper_bound_message = (
+                f"The question creator thinks the outcome is likely not higher/later than {upper_bound_number} {unit_of_measure}."
+            )
         else:
             upper_bound_message = f"The outcome cannot be higher/later than {upper_bound_number} {unit_of_measure}."
 
         if getattr(question, "open_lower_bound", False):
-            lower_bound_message = f"The question creator thinks the outcome is likely not lower/earlier than {lower_bound_number} {unit_of_measure}."
+            lower_bound_message = (
+                f"The question creator thinks the outcome is likely not lower/earlier than {lower_bound_number} {unit_of_measure}."
+            )
         else:
             lower_bound_message = f"The outcome cannot be lower/earlier than {lower_bound_number} {unit_of_measure}."
         return upper_bound_message, lower_bound_message
@@ -937,7 +959,9 @@ class LinkupExaSpringBot2026(ForecastBot):
     ) -> ReasonedPrediction[ConditionalPrediction]:
         parent_info, full_research = await self._get_question_prediction_info(question.parent, research, "parent")
         child_info, full_research = await self._get_question_prediction_info(question.child, full_research, "child")
-        yes_info, full_research = await self._get_question_prediction_info(question.question_yes, full_research, "yes")
+        yes_info, full_research = await self._get_question_prediction_info(
+            question.question_yes, full_research, "yes"
+        )
         no_info, full_research = await self._get_question_prediction_info(question.question_no, full_research, "no")
 
         full_reasoning = clean_indents(
@@ -1042,21 +1066,13 @@ if __name__ == "__main__":
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        seasonal = asyncio.run(
-            bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
-        )
-        minibench = asyncio.run(
-            bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
-        )
-        market_pulse = asyncio.run(
-            bot.forecast_on_tournament(MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True)
-        )
+        seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        minibench = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        market_pulse = asyncio.run(bot.forecast_on_tournament(MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True))
         reports = seasonal + minibench + market_pulse
     elif run_mode == "metaculus_cup":
         bot.skip_previously_forecasted_questions = False
-        reports = asyncio.run(
-            bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
-        )
+        reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
     else:
         EXAMPLE_QUESTIONS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
