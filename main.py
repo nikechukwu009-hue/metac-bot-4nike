@@ -567,7 +567,7 @@ class LinkupExaSpringBot2026(ForecastBot):
             --- Model rationales (compressed) ---
             {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])}
             """
-        ).strip()
+        .strip()
 
         logger.info(f"Binary median samples for URL {question.page_url}: {samples} -> {p_final}")
         return ReasonedPrediction(prediction_value=p_final, reasoning=combined_reasoning)
