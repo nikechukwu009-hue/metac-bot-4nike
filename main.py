@@ -39,6 +39,9 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Precompiled whitespace normalizer (avoids backslashes inside f-string expressions)
+_WS_RE = re.compile(r"\s+")
+
 # Use OpenRouter's "openrouter/free" for ALL roles (forecaster, summarizer, parser).
 # OpenRouter will route to a free model as available.
 OPENROUTER_DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "openrouter/free")
@@ -242,7 +245,7 @@ def _rank_and_format_sources(items: List[Dict], max_to_keep: int = 14) -> Tuple[
         else:
             text = (it.get("content") or it.get("text") or "").strip()
 
-        snippet = re.sub(r"\s+", " ", text)[:420]
+        snippet = _WS_RE.sub(" ", text)[:420]
         score = _score_source(url, title=title, snippet=snippet)
         scored.append((score, url, title, snippet))
 
@@ -265,7 +268,6 @@ def _rank_and_format_sources(items: List[Dict], max_to_keep: int = 14) -> Tuple[
 
 
 class LinkupExaSpringBot2026(ForecastBot):
-    # Bot name requested
     BOT_NAME = "nike"
 
     _max_concurrent_questions = int(os.getenv("MAX_CONCURRENT_QUESTIONS", "1"))
@@ -276,7 +278,6 @@ class LinkupExaSpringBot2026(ForecastBot):
     _extremize_target = float(os.getenv("EXTREMIZE_TARGET", "0.90"))
 
     def __init__(self, *args, **kwargs):
-        # Force all roles to use openrouter/free (same model)
         kwargs["llms"] = {
             "default": GeneralLlm(
                 model=OPENROUTER_DEFAULT_MODEL,
@@ -298,13 +299,9 @@ class LinkupExaSpringBot2026(ForecastBot):
             ),
         }
 
-        # Attempt to set bot name if ForecastBot supports it (safe no-op if ignored)
         kwargs.setdefault("name", self.BOT_NAME)
         super().__init__(*args, **kwargs)
 
-    # -----------------------------
-    # Prompt de-correlation variants
-    # -----------------------------
     def _variant_prefix(self, i: int) -> str:
         variants = [
             "Variant A (Outside view heavy): Start from base rates/reference classes and update cautiously.",
@@ -315,9 +312,6 @@ class LinkupExaSpringBot2026(ForecastBot):
         ]
         return variants[i % len(variants)]
 
-    # -----------------------------
-    # Numeric/date sanitization
-    # -----------------------------
     def _enforce_monotone_non_decreasing(self, xs: List[float]) -> List[float]:
         out: List[float] = []
         last: float | None = None
@@ -376,9 +370,6 @@ class LinkupExaSpringBot2026(ForecastBot):
 
         return [Percentile(percentile=plist[i].percentile, value=vals[i]) for i in range(len(plist))]
 
-    # -----------------------------
-    # Research (rank sources + top only)
-    # -----------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             q = question.question_text.strip()
@@ -552,7 +543,7 @@ class LinkupExaSpringBot2026(ForecastBot):
         p_final = self._maybe_extremize_binary(p_med, ev)
 
         compressed_rationales = "\n".join(
-            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+            [f"[Sample {j+1}] {_WS_RE.sub(' ', r)[:900]}" for j, r in enumerate(reasonings)]
         )
 
         combined_reasoning = clean_indents(
@@ -619,7 +610,7 @@ class LinkupExaSpringBot2026(ForecastBot):
         final_list = PredictedOptionList.from_dict(final_probs)
 
         compressed_rationales = "\n".join(
-            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+            [f"[Sample {j+1}] {_WS_RE.sub(' ', r)[:900]}" for j, r in enumerate(reasonings)]
         )
 
         combined_reasoning = clean_indents(
@@ -714,7 +705,7 @@ class LinkupExaSpringBot2026(ForecastBot):
         dist = NumericDistribution.from_question(merged, question)  # type: ignore
 
         compressed_rationales = "\n".join(
-            [f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)]
+            [f"[Sample {j+1}] {_WS_RE.sub(' ', r)[:900]}" for j, r in enumerate(reasonings)]
         )
 
         combined_reasoning = clean_indents(
