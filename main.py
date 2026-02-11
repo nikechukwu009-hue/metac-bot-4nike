@@ -565,7 +565,7 @@ class LinkupExaSpringBot2026(ForecastBot):
             Final probability (after evidence rule): {p_final:.3f}
 
             --- Model rationales (compressed) ---
-            {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])}
+            {chr(10).join([f"[Sample {j+1}] {re.sub(r'\\s+', ' ', r)[:900]}" for j, r in enumerate(reasonings)])})
             """
         .strip()
 
