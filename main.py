@@ -42,8 +42,13 @@ logger = logging.getLogger(__name__)
 # Precompiled whitespace normalizer (avoids backslashes inside f-string expressions)
 _WS_RE = re.compile(r"\s+")
 
-# Use OpenRouter's "openrouter/free" for ALL roles (forecaster, summarizer, parser, researcher).
-OPENROUTER_DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "openrouter/free")
+# ---------------------------------------------------------------------
+# IMPORTANT: OpenRouter + litellm compatibility
+# - Some litellm OpenRouter adapters strip the first "openrouter/".
+# - If you set model="openrouter/free", the request may become model="free".
+# - To be robust, default to "openrouter/openrouter/free" so stripping still leaves "openrouter/free".
+# ---------------------------------------------------------------------
+OPENROUTER_DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "openrouter/openrouter/free")
 OPENROUTER_PARSER_MODEL = os.getenv("OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL)
 
 LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
@@ -113,7 +118,7 @@ class EvidenceSummary:
 
 @dataclass
 class EvidenceSummaryOut:
-    # for structure_output parsing
+    # used for structure_output parsing
     direction: Literal["yes", "no", "unclear"]
     strength: float
     key_points: List[str]
@@ -143,6 +148,29 @@ def _median_merge_lists(values: List[float]) -> float:
     if not values:
         return 0.5
     return float(median(values))
+
+
+async def _gather_tournament_questions(
+    client: PatchedMetaculusClient,
+    tournament_slug_or_id: str,
+) -> List[MetaculusQuestion]:
+    """
+    Critical: Ensure we use the PATCHED client for tournament retrieval, so integer bounds are coerced.
+    Depending on forecasting_tools version, the method name might differ. We try common options.
+    """
+    # Try a few known method names used across versions
+    for name in ("get_questions_from_tournament", "get_questions_in_tournament", "get_tournament_questions"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            out = fn(tournament_slug_or_id)
+            # Some implementations may be async; handle both
+            if asyncio.iscoroutine(out):
+                out = await out
+            return list(out)
+    raise AttributeError(
+        "PatchedMetaculusClient does not have a tournament-question retrieval method "
+        "(expected one of: get_questions_from_tournament / get_questions_in_tournament / get_tournament_questions)."
+    )
 
 
 # -----------------------------
@@ -303,7 +331,6 @@ class LinkupExaSpringBot2026(ForecastBot):
                 timeout=60,
                 allowed_tries=2,
             ),
-            # IMPORTANT: forecasting_tools expects this purpose; otherwise it falls back to a search model.
             "researcher": GeneralLlm(
                 model=OPENROUTER_DEFAULT_MODEL,
                 temperature=0.2,
@@ -454,8 +481,12 @@ class LinkupExaSpringBot2026(ForecastBot):
             query_core = q
             query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
 
-            linkup_task1 = asyncio.create_task(self._safe_search(self.linkup_search(query_core, max_results=8, depth="deep")))
-            linkup_task2 = asyncio.create_task(self._safe_search(self.linkup_search(query_resolution, max_results=6, depth="deep")))
+            linkup_task1 = asyncio.create_task(
+                self._safe_search(self.linkup_search(query_core, max_results=8, depth="deep"))
+            )
+            linkup_task2 = asyncio.create_task(
+                self._safe_search(self.linkup_search(query_resolution, max_results=6, depth="deep"))
+            )
             exa_task1 = asyncio.create_task(self._safe_search(self.exa_search(query_core, max_results=10)))
             exa_task2 = asyncio.create_task(self._safe_search(self.exa_search(query_resolution, max_results=8)))
 
@@ -537,7 +568,7 @@ class LinkupExaSpringBot2026(ForecastBot):
         )
         raw = await self.get_llm("default", "llm").invoke(prompt)
 
-        # Preferred: structured parsing (more robust than regex JSON extraction)
+        # Preferred: structured parsing
         try:
             parsed: EvidenceSummaryOut = await structure_output(
                 text_to_structure=raw,
@@ -735,7 +766,6 @@ class LinkupExaSpringBot2026(ForecastBot):
         percentile_samples: List[List[Percentile]] = []
 
         if is_date:
-            # Keep this consistent with DatePercentile parsing by requiring an ISO datetime.
             parsing_instructions = clean_indents(
                 """
                 Parse a percentile distribution for a date question.
@@ -1120,7 +1150,7 @@ class LinkupExaSpringBot2026(ForecastBot):
         ).strip()
 
 
-if __name__ == "__main__":
+async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1151,18 +1181,25 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
     )
 
-    # IMPORTANT: use patched client to coerce integer bounds -> float bounds
     client = PatchedMetaculusClient()
 
     try:
         if run_mode == "tournament":
-            seasonal = asyncio.run(bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
-            minibench = asyncio.run(bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
-            market_pulse = asyncio.run(bot.forecast_on_tournament(MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True))
-            reports = seasonal + minibench + market_pulse
+            # CRITICAL CHANGE:
+            # - fetch tournament questions using PATCHED client
+            # - forecast using forecast_questions() to ensure patched parsing applies
+            seasonal_qs = await _gather_tournament_questions(client, client.CURRENT_AI_COMPETITION_ID)
+            minibench_qs = await _gather_tournament_questions(client, client.CURRENT_MINIBENCH_ID)
+            market_pulse_qs = await _gather_tournament_questions(client, MARKET_PULSE_TOURNAMENT_SLUG)
+
+            questions = seasonal_qs + minibench_qs + market_pulse_qs
+            reports = await bot.forecast_questions(questions, return_exceptions=True)
+
         elif run_mode == "metaculus_cup":
             bot.skip_previously_forecasted_questions = False
-            reports = asyncio.run(bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+            cup_qs = await _gather_tournament_questions(client, client.CURRENT_METACULUS_CUP_ID)
+            reports = await bot.forecast_questions(cup_qs, return_exceptions=True)
+
         else:
             EXAMPLE_QUESTIONS = [
                 "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
@@ -1172,12 +1209,13 @@ if __name__ == "__main__":
             ]
             bot.skip_previously_forecasted_questions = False
             questions = [client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
-            reports = asyncio.run(bot.forecast_questions(questions, return_exceptions=True))
+            reports = await bot.forecast_questions(questions, return_exceptions=True)
 
         bot.log_report_summary(reports)
+
     finally:
-        # Close shared HTTP client cleanly
-        try:
-            asyncio.run(bot.aclose())
-        except Exception:
-            pass
+        await bot.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
