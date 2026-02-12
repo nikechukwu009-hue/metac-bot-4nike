@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import dotenv
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Tuple, Optional, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -64,6 +64,7 @@ MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
 _WS_RE = re.compile(r"\s+")
 
 # Keys observed in Metaculus/forecasting_tools payloads that can carry numeric bounds
+# (keep this, but ALSO add a regex fallback because Metaculus/clients sometimes vary key naming)
 _BOUND_KEYS = {
     "upper_bound",
     "lower_bound",
@@ -75,18 +76,56 @@ _BOUND_KEYS = {
     "nominalLowerBound",
 }
 
+# More robust: match any key that looks like *upper*bound* or *lower*bound* case-insensitively
+_BOUND_KEY_RE = re.compile(r"(upper|lower).*bound", re.IGNORECASE)
+
+
+def _looks_like_bound_key(k: Any) -> bool:
+    if not isinstance(k, str):
+        return False
+    return (k in _BOUND_KEYS) or bool(_BOUND_KEY_RE.search(k))
+
+
+def _to_float_if_int_like(v: Any) -> Any:
+    """
+    Convert int -> float and also numeric strings like "11" -> 11.0
+    but leave non-numeric strings untouched.
+    """
+    if isinstance(v, int):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        # Accept plain ints and floats in string form, but avoid things like "11%" or "1e6"
+        # (you can relax this if needed)
+        if re.fullmatch(r"[-+]?\d+", s):
+            try:
+                return float(int(s))
+            except Exception:
+                return v
+        if re.fullmatch(r"[-+]?\d+\.\d+", s):
+            try:
+                return float(s)
+            except Exception:
+                return v
+    return v
+
 
 def _coerce_int_bounds_to_float(obj: Any) -> Any:
     """
     Recursively convert int bounds -> float bounds in dict/list payloads.
-    Prevents forecasting_tools assertions like: assert isinstance(upper_bound, float)
+
+    This fixes forecasting_tools assertions like:
+        assert isinstance(upper_bound, float)
     when API returns e.g. 200 (int) instead of 200.0 (float).
+
+    IMPORTANT: The key-name patterns are not stable across versions/endpoints,
+    so we use both a known-key allowlist and a regex fallback.
     """
     if isinstance(obj, dict):
         out: Dict[Any, Any] = {}
         for k, v in obj.items():
-            if isinstance(k, str) and k in _BOUND_KEYS and isinstance(v, int):
-                out[k] = float(v)
+            if _looks_like_bound_key(k):
+                out[k] = _to_float_if_int_like(v)
             else:
                 out[k] = _coerce_int_bounds_to_float(v)
         return out
@@ -100,16 +139,35 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 # -----------------------------
 from forecasting_tools.data_models.data_organizer import DataOrganizer  # noqa: E402
 
+# Grab the original descriptor from the class dict so we preserve staticmethod/classmethod behavior
+_orig_descriptor = DataOrganizer.__dict__.get("get_question_from_post_json")
 _ORIG_GET_Q = DataOrganizer.get_question_from_post_json
 
 
-def _patched_get_question_from_post_json(post_json: Any, *args: Any, **kwargs: Any):
-    post_json = _coerce_int_bounds_to_float(post_json)
-    return _ORIG_GET_Q(post_json, *args, **kwargs)
+def _patched_get_question_from_post_json(*args: Any, **kwargs: Any):
+    """
+    Wrapper that coerces bound fields in *whatever* arg position carries the post_json.
+
+    Handles both call forms:
+      - staticmethod: (post_json, ...)
+      - classmethod: (cls, post_json, ...)
+    """
+    args_list = list(args)
+
+    # Find the first dict/list argument and coerce it.
+    for i, a in enumerate(args_list):
+        if isinstance(a, (dict, list)):
+            args_list[i] = _coerce_int_bounds_to_float(a)
+            break
+
+    return _ORIG_GET_Q(*args_list, **kwargs)
 
 
-# Keep behavior consistent with original staticmethod
-DataOrganizer.get_question_from_post_json = staticmethod(_patched_get_question_from_post_json)
+# Re-assign preserving descriptor type
+if isinstance(_orig_descriptor, classmethod):
+    DataOrganizer.get_question_from_post_json = classmethod(_patched_get_question_from_post_json)
+else:
+    DataOrganizer.get_question_from_post_json = staticmethod(_patched_get_question_from_post_json)
 
 
 class PatchedMetaculusClient(MetaculusClient):
@@ -125,16 +183,16 @@ class PatchedMetaculusClient(MetaculusClient):
             group_question_mode=group_question_mode,
         )
 
-    async def get_questions_from_tournament(self, tournament_id_or_slug: str | int):
+    async def get_questions_from_tournament(self, tournament_id_or_slug: Union[str, int]):
         return await self._get_open_tournament_questions(tournament_id_or_slug)
 
-    async def get_questions_in_tournament(self, tournament_id_or_slug: str | int):
+    async def get_questions_in_tournament(self, tournament_id_or_slug: Union[str, int]):
         return await self._get_open_tournament_questions(tournament_id_or_slug)
 
-    async def get_tournament_questions(self, tournament_id_or_slug: str | int):
+    async def get_tournament_questions(self, tournament_id_or_slug: Union[str, int]):
         return await self._get_open_tournament_questions(tournament_id_or_slug)
 
-    async def _get_open_tournament_questions(self, tournament_id_or_slug: str | int):
+    async def _get_open_tournament_questions(self, tournament_id_or_slug: Union[str, int]):
         """
         Try common upstream method names across forecasting_tools versions.
         """
@@ -181,7 +239,7 @@ async def linkup_search(query: str, max_results: int = 8, depth: str = "deep") -
     return data.get("results", []) or []
 
 
-async def exa_search(query: str, max_results: int = 8, max_age_hours: int | None = None) -> List[Dict]:
+async def exa_search(query: str, max_results: int = 8, max_age_hours: Optional[int] = None) -> List[Dict]:
     if not EXA_API_KEY:
         return []
     headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
@@ -232,7 +290,19 @@ _HIGH_TRUST_DOMAINS = {
 }
 
 _MED_TRUST_HINTS = ("investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com")
-_LOW_TRUST_HINTS = ("pinterest.", "quora.", "medium.com", "substack.com", "blogspot.", "wordpress.", "tumblr.", "tiktok.", "facebook.", "x.com", "twitter.com")
+_LOW_TRUST_HINTS = (
+    "pinterest.",
+    "quora.",
+    "medium.com",
+    "substack.com",
+    "blogspot.",
+    "wordpress.",
+    "tumblr.",
+    "tiktok.",
+    "facebook.",
+    "x.com",
+    "twitter.com",
+)
 
 
 def _domain_of(url: str) -> str:
@@ -310,7 +380,7 @@ class SpringTemplateBot2026(ForecastBot):
     Template bot structure preserved.
     Changes embedded:
     - Robust OpenRouter model defaults (OPENROUTER_DEFAULT_MODEL)
-    - Global DataOrganizer patch + PatchedMetaculusClient to fix int upper/lower bounds
+    - More robust global DataOrganizer patch + PatchedMetaculusClient to fix int/string bounds
     - Optional Linkup+Exa research ranking added as an extra option
     """
 
@@ -354,7 +424,8 @@ class SpringTemplateBot2026(ForecastBot):
                 research = await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
 
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
+                # Python 3.8-safe removeprefix
+                model_name = researcher[len("smart-searcher/") :] if researcher.startswith("smart-searcher/") else researcher
                 searcher = SmartSearcher(
                     model=model_name,
                     temperature=0,
@@ -727,7 +798,7 @@ class SpringTemplateBot2026(ForecastBot):
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     def _create_upper_and_lower_bound_messages(
-        self, question: NumericQuestion | DateQuestion
+        self, question: Union[NumericQuestion, DateQuestion]
     ) -> tuple[str, str]:
         # NOTE: also coerces any lingering int bounds just in case
         if isinstance(question, NumericQuestion):
