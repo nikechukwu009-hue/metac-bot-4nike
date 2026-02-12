@@ -43,10 +43,6 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 # Robust OpenRouter model defaults for LiteLLM
 # -----------------------------
-# With LiteLLM, OpenRouter model strings usually must look like:
-#   "openrouter/<openrouter_model_id>"
-# If you want the OpenRouter router "openrouter/free", pass:
-#   "openrouter/openrouter/free"
 OPENROUTER_DEFAULT_MODEL = os.getenv("OPENROUTER_DEFAULT_MODEL", "openrouter/openrouter/free")
 OPENROUTER_PARSER_MODEL = os.getenv("OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL)
 
@@ -64,7 +60,6 @@ MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
 _WS_RE = re.compile(r"\s+")
 
 # Keys observed in Metaculus/forecasting_tools payloads that can carry numeric bounds
-# (keep this, but ALSO add a regex fallback because Metaculus/clients sometimes vary key naming)
 _BOUND_KEYS = {
     "upper_bound",
     "lower_bound",
@@ -88,15 +83,12 @@ def _looks_like_bound_key(k: Any) -> bool:
 
 def _to_float_if_int_like(v: Any) -> Any:
     """
-    Convert int -> float and also numeric strings like "11" -> 11.0
-    but leave non-numeric strings untouched.
+    Convert int -> float and numeric strings like "11" -> 11.0.
     """
     if isinstance(v, int):
         return float(v)
     if isinstance(v, str):
         s = v.strip()
-        # Accept plain ints and floats in string form, but avoid things like "11%" or "1e6"
-        # (you can relax this if needed)
         if re.fullmatch(r"[-+]?\d+", s):
             try:
                 return float(int(s))
@@ -113,13 +105,7 @@ def _to_float_if_int_like(v: Any) -> Any:
 def _coerce_int_bounds_to_float(obj: Any) -> Any:
     """
     Recursively convert int bounds -> float bounds in dict/list payloads.
-
-    This fixes forecasting_tools assertions like:
-        assert isinstance(upper_bound, float)
-    when API returns e.g. 200 (int) instead of 200.0 (float).
-
-    IMPORTANT: The key-name patterns are not stable across versions/endpoints,
-    so we use both a known-key allowlist and a regex fallback.
+    Fixes upstream assertions that upper/lower bounds are floats.
     """
     if isinstance(obj, dict):
         out: Dict[Any, Any] = {}
@@ -135,45 +121,67 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 
 
 # -----------------------------
-# GLOBAL PATCH: make sure int bounds are coerced in the main parsing path
+# GLOBAL PATCH (FIXED): coerce bounds without breaking classmethod/staticmethod binding
 # -----------------------------
 from forecasting_tools.data_models.data_organizer import DataOrganizer  # noqa: E402
 
-# Grab the original descriptor from the class dict so we preserve staticmethod/classmethod behavior
+# IMPORTANT:
+# - If the original is a @classmethod, DataOrganizer.get_question_from_post_json is a *bound* method when accessed
+#   and will NOT expect you to pass cls again.
+# - If you wrap it incorrectly, you'll see: "takes 2 positional arguments but 3 were given"
+# So: capture the *descriptor* from __dict__, and call the underlying function correctly.
 _orig_descriptor = DataOrganizer.__dict__.get("get_question_from_post_json")
-_ORIG_GET_Q = DataOrganizer.get_question_from_post_json
+
+if isinstance(_orig_descriptor, classmethod):
+    _ORIG_KIND = "classmethod"
+    _ORIG_FUNC = _orig_descriptor.__func__
+elif isinstance(_orig_descriptor, staticmethod):
+    _ORIG_KIND = "staticmethod"
+    _ORIG_FUNC = _orig_descriptor.__func__
+else:
+    # could be a plain function (instance method) or already-unwrapped function
+    _ORIG_KIND = "function"
+    _ORIG_FUNC = _orig_descriptor  # type: ignore
 
 
 def _patched_get_question_from_post_json(*args: Any, **kwargs: Any):
     """
-    Wrapper that coerces bound fields in *whatever* arg position carries the post_json.
-
-    Handles both call forms:
-      - staticmethod: (post_json, ...)
-      - classmethod: (cls, post_json, ...)
+    Coerce bounds in the post_json argument and forward to the original implementation,
+    preserving the original binding semantics (classmethod/staticmethod/instance method).
     """
     args_list = list(args)
 
-    # Find the first dict/list argument and coerce it.
+    # Coerce the first dict/list argument (post_json)
     for i, a in enumerate(args_list):
         if isinstance(a, (dict, list)):
             args_list[i] = _coerce_int_bounds_to_float(a)
             break
 
-    return _ORIG_GET_Q(*args_list, **kwargs)
+    if _ORIG_KIND == "classmethod":
+        # args_list[0] is cls
+        cls = args_list[0]
+        return _ORIG_FUNC(cls, *args_list[1:], **kwargs)
+    if _ORIG_KIND == "function":
+        # instance method (unlikely here, but safe)
+        self_obj = args_list[0]
+        return _ORIG_FUNC(self_obj, *args_list[1:], **kwargs)
+    # staticmethod
+    return _ORIG_FUNC(*args_list, **kwargs)
 
 
-# Re-assign preserving descriptor type
-if isinstance(_orig_descriptor, classmethod):
+# Re-assign in the same "shape" as originally declared
+if _ORIG_KIND == "classmethod":
     DataOrganizer.get_question_from_post_json = classmethod(_patched_get_question_from_post_json)
-else:
+elif _ORIG_KIND == "staticmethod":
     DataOrganizer.get_question_from_post_json = staticmethod(_patched_get_question_from_post_json)
+else:
+    DataOrganizer.get_question_from_post_json = _patched_get_question_from_post_json
 
 
 class PatchedMetaculusClient(MetaculusClient):
     """
-    Extra safety: if any code path inside this client calls post-json->question conversion,
-    we coerce bounds first. Also includes tournament retrieval aliases to fit different versions.
+    Extra safety: coerce bounds in any post-json->question conversion path.
+    Also includes tournament retrieval aliases to fit different versions.
     """
 
     def _post_json_to_questions_while_handling_groups(self, post_json_from_api, group_question_mode=None):
@@ -290,19 +298,7 @@ _HIGH_TRUST_DOMAINS = {
 }
 
 _MED_TRUST_HINTS = ("investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com")
-_LOW_TRUST_HINTS = (
-    "pinterest.",
-    "quora.",
-    "medium.com",
-    "substack.com",
-    "blogspot.",
-    "wordpress.",
-    "tumblr.",
-    "tiktok.",
-    "facebook.",
-    "x.com",
-    "twitter.com",
-)
+_LOW_TRUST_HINTS = ("pinterest.", "quora.", "medium.com", "substack.com", "blogspot.", "wordpress.", "tumblr.", "tiktok.", "facebook.", "x.com", "twitter.com")
 
 
 def _domain_of(url: str) -> str:
@@ -380,8 +376,8 @@ class SpringTemplateBot2026(ForecastBot):
     Template bot structure preserved.
     Changes embedded:
     - Robust OpenRouter model defaults (OPENROUTER_DEFAULT_MODEL)
-    - More robust global DataOrganizer patch + PatchedMetaculusClient to fix int/string bounds
-    - Optional Linkup+Exa research ranking added as an extra option
+    - Fixed DataOrganizer patch that preserves classmethod/staticmethod call semantics
+    - Robust bound coercion (ints + numeric strings, regex key matching)
     """
 
     _max_concurrent_questions = 1
@@ -424,7 +420,6 @@ class SpringTemplateBot2026(ForecastBot):
                 research = await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
 
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-                # Python 3.8-safe removeprefix
                 model_name = researcher[len("smart-searcher/") :] if researcher.startswith("smart-searcher/") else researcher
                 searcher = SmartSearcher(
                     model=model_name,
@@ -436,7 +431,6 @@ class SpringTemplateBot2026(ForecastBot):
                 research = await searcher.invoke(prompt)
 
             elif isinstance(researcher, str) and researcher == "linkup+exa":
-                # Optional: Linkup+Exa fallback research mode (ranked snippets + summarization)
                 q = question.question_text.strip()
                 criteria = (question.resolution_criteria or "").strip()
                 query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
@@ -512,12 +506,10 @@ class SpringTemplateBot2026(ForecastBot):
             Question background:
             {question.background_info}
 
-
             This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -567,14 +559,12 @@ class SpringTemplateBot2026(ForecastBot):
 
             The options are: {question.options}
 
-
             Background:
             {question.background_info}
 
             {question.resolution_criteria}
 
             {question.fine_print}
-
 
             Your research assistant says:
             {research}
@@ -800,7 +790,6 @@ class SpringTemplateBot2026(ForecastBot):
     def _create_upper_and_lower_bound_messages(
         self, question: Union[NumericQuestion, DateQuestion]
     ) -> tuple[str, str]:
-        # NOTE: also coerces any lingering int bounds just in case
         if isinstance(question, NumericQuestion):
             upper_bound_number = float(question.nominal_upper_bound) if question.nominal_upper_bound is not None else float(question.upper_bound)
             lower_bound_number = float(question.nominal_lower_bound) if question.nominal_lower_bound is not None else float(question.lower_bound)
