@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 import dotenv
 from typing import Any, Dict, List, Literal, Tuple, Optional, Union
 from urllib.parse import urlparse
@@ -87,6 +88,8 @@ def _to_float_if_int_like(v: Any) -> Any:
     """
     if isinstance(v, int):
         return float(v)
+    if isinstance(v, Decimal):
+        return float(v)
     if isinstance(v, str):
         s = v.strip()
         if re.fullmatch(r"[-+]?\d+", s):
@@ -121,15 +124,54 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 
 
 # -----------------------------
-# GLOBAL PATCH (FIXED): coerce bounds without breaking classmethod/staticmethod binding
+# HARD PATCH: NumericQuestion bound coercion
+# (fixes AssertionError Upper bound is 8000000000)
+# -----------------------------
+_NUMERIC_BOUND_ATTRS = (
+    "upper_bound",
+    "lower_bound",
+    "nominal_upper_bound",
+    "nominal_lower_bound",
+)
+
+_ORIG_NUMERIC_POST_INIT = getattr(NumericQuestion, "__post_init__", None)
+
+
+def _coerce_to_float(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return v
+    if isinstance(v, (int, Decimal)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if re.fullmatch(r"[-+]?\d+", s):
+            return float(int(s))
+        if re.fullmatch(r"[-+]?\d+\.\d+", s):
+            return float(s)
+    return v
+
+
+def _patched_numeric_post_init(self: NumericQuestion):
+    # Coerce bounds BEFORE upstream assertions run
+    for attr in _NUMERIC_BOUND_ATTRS:
+        if hasattr(self, attr):
+            setattr(self, attr, _coerce_to_float(getattr(self, attr)))
+
+    # Run upstream __post_init__ (contains assertions and other invariants)
+    if callable(_ORIG_NUMERIC_POST_INIT):
+        _ORIG_NUMERIC_POST_INIT(self)
+
+
+NumericQuestion.__post_init__ = _patched_numeric_post_init
+
+
+# -----------------------------
+# GLOBAL PATCH: coerce bounds in DataOrganizer parsing path too (extra safety)
 # -----------------------------
 from forecasting_tools.data_models.data_organizer import DataOrganizer  # noqa: E402
 
-# IMPORTANT:
-# - If the original is a @classmethod, DataOrganizer.get_question_from_post_json is a *bound* method when accessed
-#   and will NOT expect you to pass cls again.
-# - If you wrap it incorrectly, you'll see: "takes 2 positional arguments but 3 were given"
-# So: capture the *descriptor* from __dict__, and call the underlying function correctly.
 _orig_descriptor = DataOrganizer.__dict__.get("get_question_from_post_json")
 
 if isinstance(_orig_descriptor, classmethod):
@@ -139,37 +181,28 @@ elif isinstance(_orig_descriptor, staticmethod):
     _ORIG_KIND = "staticmethod"
     _ORIG_FUNC = _orig_descriptor.__func__
 else:
-    # could be a plain function (instance method) or already-unwrapped function
     _ORIG_KIND = "function"
     _ORIG_FUNC = _orig_descriptor  # type: ignore
 
 
 def _patched_get_question_from_post_json(*args: Any, **kwargs: Any):
-    """
-    Coerce bounds in the post_json argument and forward to the original implementation,
-    preserving the original binding semantics (classmethod/staticmethod/instance method).
-    """
     args_list = list(args)
 
-    # Coerce the first dict/list argument (post_json)
+    # Coerce first dict/list argument (post_json)
     for i, a in enumerate(args_list):
         if isinstance(a, (dict, list)):
             args_list[i] = _coerce_int_bounds_to_float(a)
             break
 
     if _ORIG_KIND == "classmethod":
-        # args_list[0] is cls
         cls = args_list[0]
         return _ORIG_FUNC(cls, *args_list[1:], **kwargs)
     if _ORIG_KIND == "function":
-        # instance method (unlikely here, but safe)
         self_obj = args_list[0]
         return _ORIG_FUNC(self_obj, *args_list[1:], **kwargs)
-    # staticmethod
     return _ORIG_FUNC(*args_list, **kwargs)
 
 
-# Re-assign in the same "shape" as originally declared
 if _ORIG_KIND == "classmethod":
     DataOrganizer.get_question_from_post_json = classmethod(_patched_get_question_from_post_json)
 elif _ORIG_KIND == "staticmethod":
@@ -201,9 +234,6 @@ class PatchedMetaculusClient(MetaculusClient):
         return await self._get_open_tournament_questions(tournament_id_or_slug)
 
     async def _get_open_tournament_questions(self, tournament_id_or_slug: Union[str, int]):
-        """
-        Try common upstream method names across forecasting_tools versions.
-        """
         for name in (
             "get_all_open_questions_from_tournament",
             "get_open_questions_from_tournament",
@@ -298,7 +328,19 @@ _HIGH_TRUST_DOMAINS = {
 }
 
 _MED_TRUST_HINTS = ("investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com")
-_LOW_TRUST_HINTS = ("pinterest.", "quora.", "medium.com", "substack.com", "blogspot.", "wordpress.", "tumblr.", "tiktok.", "facebook.", "x.com", "twitter.com")
+_LOW_TRUST_HINTS = (
+    "pinterest.",
+    "quora.",
+    "medium.com",
+    "substack.com",
+    "blogspot.",
+    "wordpress.",
+    "tumblr.",
+    "tiktok.",
+    "facebook.",
+    "x.com",
+    "twitter.com",
+)
 
 
 def _domain_of(url: str) -> str:
@@ -374,10 +416,8 @@ def _rank_and_format_sources(items: List[Dict], max_to_keep: int = 14) -> Tuple[
 class SpringTemplateBot2026(ForecastBot):
     """
     Template bot structure preserved.
-    Changes embedded:
-    - Robust OpenRouter model defaults (OPENROUTER_DEFAULT_MODEL)
-    - Fixed DataOrganizer patch that preserves classmethod/staticmethod call semantics
-    - Robust bound coercion (ints + numeric strings, regex key matching)
+    Fix included:
+    - NumericQuestion.__post_init__ coercion to float for bounds (stops AssertionError Upper bound is ...)
     """
 
     _max_concurrent_questions = 1
@@ -420,6 +460,7 @@ class SpringTemplateBot2026(ForecastBot):
                 research = await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
 
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
+                # Python 3.8-safe removeprefix
                 model_name = researcher[len("smart-searcher/") :] if researcher.startswith("smart-searcher/") else researcher
                 searcher = SmartSearcher(
                     model=model_name,
