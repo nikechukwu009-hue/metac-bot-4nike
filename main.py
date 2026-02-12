@@ -70,8 +70,6 @@ _BOUND_KEYS = {
     "nominalUpperBound",
     "nominalLowerBound",
 }
-
-# More robust: match any key that looks like *upper*bound* or *lower*bound* case-insensitively
 _BOUND_KEY_RE = re.compile(r"(upper|lower).*bound", re.IGNORECASE)
 
 
@@ -82,9 +80,7 @@ def _looks_like_bound_key(k: Any) -> bool:
 
 
 def _to_float_if_int_like(v: Any) -> Any:
-    """
-    Convert int -> float and numeric strings like "11" -> 11.0.
-    """
+    """Convert int/Decimal/numeric strings to float where possible."""
     if isinstance(v, int):
         return float(v)
     if isinstance(v, Decimal):
@@ -105,10 +101,7 @@ def _to_float_if_int_like(v: Any) -> Any:
 
 
 def _coerce_int_bounds_to_float(obj: Any) -> Any:
-    """
-    Recursively convert int bounds -> float bounds in dict/list payloads.
-    Fixes upstream assertions that upper/lower bounds are floats.
-    """
+    """Recursively convert any *bound* fields to float where they are int-like."""
     if isinstance(obj, dict):
         out: Dict[Any, Any] = {}
         for k, v in obj.items():
@@ -123,16 +116,9 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 
 
 # -----------------------------
-# HARD PATCH: NumericQuestion bound coercion
-# (prevents AssertionError Upper bound is 8000000000)
+# HARD PATCH 1: NumericQuestion bound coercion (object-level)
 # -----------------------------
-_NUMERIC_BOUND_ATTRS = (
-    "upper_bound",
-    "lower_bound",
-    "nominal_upper_bound",
-    "nominal_lower_bound",
-)
-
+_NUMERIC_BOUND_ATTRS = ("upper_bound", "lower_bound", "nominal_upper_bound", "nominal_lower_bound")
 _ORIG_NUMERIC_POST_INIT = getattr(NumericQuestion, "__post_init__", None)
 
 
@@ -153,66 +139,145 @@ def _coerce_to_float(v: Any) -> Any:
 
 
 def _patched_numeric_post_init(self: NumericQuestion):
-    # Coerce bounds BEFORE upstream assertions run
+    # Coerce bounds BEFORE upstream assertions run (if any)
     for attr in _NUMERIC_BOUND_ATTRS:
         if hasattr(self, attr):
             setattr(self, attr, _coerce_to_float(getattr(self, attr)))
-
-    # Run upstream __post_init__ (contains assertions and other invariants)
     if callable(_ORIG_NUMERIC_POST_INIT):
         _ORIG_NUMERIC_POST_INIT(self)
 
 
-NumericQuestion.__post_init__ = _patched_numeric_post_init
+NumericQuestion.__post_init__ = _patched_numeric_post_init  # type: ignore
 
 
 # -----------------------------
-# GLOBAL PATCH: coerce bounds in DataOrganizer parsing path too (extra safety)
+# HARD PATCH 2: Patch ingestion path in forecasting_tools.helpers.metaculus_client
+# so post-json bounds are coerced BEFORE library assertions fire.
 # -----------------------------
-from forecasting_tools.data_models.data_organizer import DataOrganizer  # noqa: E402
+def _monkeypatch_metaculus_client_ingestion() -> None:
+    try:
+        import inspect
+        import forecasting_tools.helpers.metaculus_client as mc  # type: ignore
+    except Exception as e:
+        logger.warning(f"Could not import forecasting_tools.helpers.metaculus_client for patching: {e}")
+        return
 
-_orig_descriptor = DataOrganizer.__dict__.get("get_question_from_post_json")
+    def _wrap_callable(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
 
-if isinstance(_orig_descriptor, classmethod):
-    _ORIG_KIND = "classmethod"
-    _ORIG_FUNC = _orig_descriptor.__func__
-elif isinstance(_orig_descriptor, staticmethod):
-    _ORIG_KIND = "staticmethod"
-    _ORIG_FUNC = _orig_descriptor.__func__
-else:
-    _ORIG_KIND = "function"
-    _ORIG_FUNC = _orig_descriptor  # type: ignore
+        if is_async:
+
+            async def _aw(*args, **kwargs):
+                new_args = list(args)
+                for i, a in enumerate(new_args):
+                    if isinstance(a, (dict, list)):
+                        new_args[i] = _coerce_int_bounds_to_float(a)
+                        break
+                new_kwargs = {
+                    k: _coerce_int_bounds_to_float(v) if isinstance(v, (dict, list)) else v
+                    for k, v in kwargs.items()
+                }
+                return await fn(*new_args, **new_kwargs)
+
+            _aw.__name__ = getattr(fn, "__name__", "wrapped_async")
+            return _aw
+
+        def _sw(*args, **kwargs):
+            new_args = list(args)
+            for i, a in enumerate(new_args):
+                if isinstance(a, (dict, list)):
+                    new_args[i] = _coerce_int_bounds_to_float(a)
+                    break
+            new_kwargs = {
+                k: _coerce_int_bounds_to_float(v) if isinstance(v, (dict, list)) else v
+                for k, v in kwargs.items()
+            }
+            return fn(*new_args, **new_kwargs)
+
+        _sw.__name__ = getattr(fn, "__name__", "wrapped_sync")
+        return _sw
+
+    # Patch DataOrganizer.get_question_from_post_json safely (classmethod/staticmethod/function)
+    try:
+        from forecasting_tools.data_models.data_organizer import DataOrganizer  # type: ignore
+
+        orig_attr = DataOrganizer.__dict__.get("get_question_from_post_json")
+        if isinstance(orig_attr, classmethod):
+            DataOrganizer.get_question_from_post_json = classmethod(_wrap_callable(orig_attr.__func__))  # type: ignore
+        elif isinstance(orig_attr, staticmethod):
+            DataOrganizer.get_question_from_post_json = staticmethod(_wrap_callable(orig_attr.__func__))  # type: ignore
+        elif callable(orig_attr):
+            DataOrganizer.get_question_from_post_json = _wrap_callable(orig_attr)  # type: ignore
+    except Exception as e:
+        logger.warning(f"Could not patch DataOrganizer.get_question_from_post_json: {e}")
+
+    # Patch likely ingestion helpers in module
+    candidates_by_name = {
+        "_process_post",
+        "process_post",
+        "_process_post_json",
+        "_post_json_to_question",
+        "_post_json_to_questions",
+        "_post_json_to_questions_while_handling_groups",
+        "_question_from_post_json",
+        "get_question_from_post_json",
+    }
+
+    for name in dir(mc):
+        try:
+            obj = getattr(mc, name)
+        except Exception:
+            continue
+        if not callable(obj):
+            continue
+
+        should_patch = name in candidates_by_name
+        if not should_patch:
+            try:
+                sig = inspect.signature(obj)
+                params = " ".join(sig.parameters.keys()).lower()
+                if "post_json" in params or ("post" in params and "json" in params):
+                    should_patch = True
+            except Exception:
+                pass
+
+        if should_patch:
+            try:
+                setattr(mc, name, _wrap_callable(obj))
+            except Exception:
+                pass
+
+    # Patch MetaculusClient methods in that module
+    try:
+        cls = getattr(mc, "MetaculusClient", None)
+        if cls is not None:
+            for meth_name in dir(cls):
+                if meth_name.startswith("__"):
+                    continue
+                try:
+                    meth = getattr(cls, meth_name)
+                except Exception:
+                    continue
+                if not callable(meth):
+                    continue
+                if (
+                    ("post" in meth_name.lower() and ("json" in meth_name.lower() or "question" in meth_name.lower()))
+                    or ("questions" in meth_name.lower() and "tournament" in meth_name.lower())
+                ):
+                    try:
+                        setattr(cls, meth_name, _wrap_callable(meth))
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Could not patch MetaculusClient methods: {e}")
 
 
-def _patched_get_question_from_post_json(*args: Any, **kwargs: Any):
-    args_list = list(args)
-
-    # Coerce first dict/list argument (post_json)
-    for i, a in enumerate(args_list):
-        if isinstance(a, (dict, list)):
-            args_list[i] = _coerce_int_bounds_to_float(a)
-            break
-
-    if _ORIG_KIND == "classmethod":
-        cls = args_list[0]
-        return _ORIG_FUNC(cls, *args_list[1:], **kwargs)
-    if _ORIG_KIND == "function":
-        self_obj = args_list[0]
-        return _ORIG_FUNC(self_obj, *args_list[1:], **kwargs)
-    return _ORIG_FUNC(*args_list, **kwargs)
-
-
-if _ORIG_KIND == "classmethod":
-    DataOrganizer.get_question_from_post_json = classmethod(_patched_get_question_from_post_json)
-elif _ORIG_KIND == "staticmethod":
-    DataOrganizer.get_question_from_post_json = staticmethod(_patched_get_question_from_post_json)
-else:
-    DataOrganizer.get_question_from_post_json = _patched_get_question_from_post_json
+_monkeypatch_metaculus_client_ingestion()
 
 
 class PatchedMetaculusClient(MetaculusClient):
     """
-    Extra safety: coerce bounds in any post-json->question conversion path.
+    Extra safety: coerce bounds in any post-json->question conversion path we directly see.
     Also includes tournament retrieval aliases to fit different versions.
     """
 
@@ -233,10 +298,7 @@ class PatchedMetaculusClient(MetaculusClient):
         return await self._get_open_tournament_questions(tournament_id_or_slug)
 
     async def _get_open_tournament_questions(self, tournament_id_or_slug: Union[str, int]):
-        for name in (
-            "get_all_open_questions_from_tournament",
-            "get_open_questions_from_tournament",
-        ):
+        for name in ("get_all_open_questions_from_tournament", "get_open_questions_from_tournament"):
             fn = getattr(super(), name, None)
             if callable(fn):
                 out = fn(tournament_id_or_slug)
@@ -247,12 +309,7 @@ class PatchedMetaculusClient(MetaculusClient):
         )
 
 
-async def _post_json(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: Dict[str, str],
-    payload: Dict,
-) -> Dict:
+async def _post_json(client: httpx.AsyncClient, url: str, headers: Dict[str, str], payload: Dict) -> Dict:
     r = await client.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_S)
     r.raise_for_status()
     return r.json()
@@ -322,7 +379,6 @@ _HIGH_TRUST_DOMAINS = {
     "ieee.org",
     "acm.org",
 }
-
 _MED_TRUST_HINTS = ("investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com")
 _LOW_TRUST_HINTS = (
     "pinterest.",
@@ -414,6 +470,8 @@ class SpringTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    ##################################### RESEARCH #####################################
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             research = ""
@@ -438,6 +496,7 @@ class SpringTemplateBot2026(ForecastBot):
 
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
+
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -445,6 +504,7 @@ class SpringTemplateBot2026(ForecastBot):
                 or researcher == "asknews/deep-research/high-depth"
             ):
                 research = await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
+
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
                 model_name = researcher[len("smart-searcher/") :] if researcher.startswith("smart-searcher/") else researcher
                 searcher = SmartSearcher(
@@ -455,6 +515,7 @@ class SpringTemplateBot2026(ForecastBot):
                     use_advanced_filters=False,
                 )
                 research = await searcher.invoke(prompt)
+
             elif isinstance(researcher, str) and researcher == "linkup+exa":
                 q = question.question_text.strip()
                 criteria = (question.resolution_criteria or "").strip()
@@ -507,6 +568,7 @@ class SpringTemplateBot2026(ForecastBot):
                     {url_list}
                     """
                 ).strip()
+
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
@@ -514,6 +576,8 @@ class SpringTemplateBot2026(ForecastBot):
 
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    ##################################### BINARY QUESTIONS #####################################
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         prompt = clean_indents(
@@ -562,6 +626,8 @@ class SpringTemplateBot2026(ForecastBot):
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
         logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}.")
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+
+    ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -628,10 +694,57 @@ class SpringTemplateBot2026(ForecastBot):
         logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}.")
         return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
 
+    ##################################### BOUND ENFORCEMENT MESSAGE #####################################
+
+    def _create_bound_enforcement_message(self, question: Union[NumericQuestion, DateQuestion]) -> str:
+        """Create explicit bound enforcement message for prompts."""
+        if isinstance(question, NumericQuestion):
+            if question.open_lower_bound:
+                lower_msg = (
+                    f"⚠️ LOWER BOUND (soft): The question creator thinks values below "
+                    f"{question.lower_bound} {question.unit_of_measure} are very unlikely, but not impossible."
+                )
+            else:
+                lower_msg = (
+                    f"⚠️ LOWER BOUND (hard): The outcome CANNOT be lower than "
+                    f"{question.lower_bound} {question.unit_of_measure}."
+                )
+
+            if question.open_upper_bound:
+                upper_msg = (
+                    f"⚠️ UPPER BOUND (soft): The question creator thinks values above "
+                    f"{question.upper_bound} {question.unit_of_measure} are very unlikely, but not impossible."
+                )
+            else:
+                upper_msg = (
+                    f"⚠️ UPPER BOUND (hard): The outcome CANNOT be higher than "
+                    f"{question.upper_bound} {question.unit_of_measure}."
+                )
+
+            return (
+                f"\n{lower_msg}\n{upper_msg}\n"
+                "⚠️ CRITICAL: Your forecast percentiles MUST respect these bounds. "
+                "Never predict values outside this range."
+            )
+
+        if isinstance(question, DateQuestion):
+            lower_date = question.lower_bound.date().isoformat()
+            upper_date = question.upper_bound.date().isoformat()
+            return (
+                f"\n⚠️ DATE BOUNDS: Your forecast MUST be between {lower_date} (earliest) "
+                f"and {upper_date} (latest). Never predict dates outside this range."
+            )
+
+        return ""
+
+    ##################################### NUMERIC QUESTIONS #####################################
+
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        bound_enforcement = self._create_bound_enforcement_message(question)
+
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -655,10 +768,12 @@ class SpringTemplateBot2026(ForecastBot):
 
             {lower_bound_message}
             {upper_bound_message}
+            {bound_enforcement}
 
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
             - Never use scientific notation.
+            - ALWAYS ensure your percentile values stay STRICTLY within the bounds above.
             - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
             Before answering you write:
@@ -666,58 +781,137 @@ class SpringTemplateBot2026(ForecastBot):
             (b) The outcome if nothing changed.
             (c) The outcome if the current trend continued.
             (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (e) A brief description of an unexpected scenario that results in a low outcome (but STILL above the lower bound).
+            (f) A brief description of an unexpected scenario that results in a high outcome (but STILL below the upper bound).
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns, BUT NEVER violate the hard bounds of the question.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: XX (lowest number value)
+            Percentile 10: XX (lowest number value, MUST be >= lower bound)
             Percentile 20: XX
             Percentile 40: XX
             Percentile 60: XX
             Percentile 80: XX
-            Percentile 90: XX (highest number value)
+            Percentile 90: XX (highest number value, MUST be <= upper bound)
             "
             """
         )
         return await self._numeric_prompt_to_forecast(question, prompt)
 
     async def _numeric_prompt_to_forecast(
-        self, question: NumericQuestion, prompt: str
+        self,
+        question: NumericQuestion,
+        prompt: str,
+        max_retries: int = 3,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a numeric question.
-            - This text is trying to answer the numeric question: "{question.question_text}".
-            - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
-            - The units for the forecast are: {question.unit_of_measure}
-            - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
-            - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
-            - If the answer doesn't give the answer in the correct units, you should parse it in the right units.
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            - Turn any values that are in scientific notation into regular numbers.
-            """
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                reasoning = await self.get_llm("default", "llm").invoke(prompt)
+                logger.info(f"Reasoning for URL {question.page_url} (attempt {attempt+1}): {reasoning}")
+
+                parsing_instructions = clean_indents(
+                    f"""
+                    The text given to you is trying to give a forecast distribution for a numeric question.
+                    - This text is trying to answer the numeric question: "{question.question_text}".
+                    - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
+                    - The units for the forecast are: {question.unit_of_measure}
+                    - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
+                    - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
+                    - CRITICAL: If the answer doesn't give the answer in the correct units, you should parse it in the right units. For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
+                    - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
+                    - Turn any values that are in scientific notation into regular numbers.
+                    - NEVER return values outside [{question.lower_bound}, {question.upper_bound}] in {question.unit_of_measure}.
+                    """
+                )
+
+                percentile_list: list[Percentile] = await structure_output(
+                    reasoning,
+                    list[Percentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+
+                # SAFE CLIPPING WITH WARNING (tournament-safe fallback)
+                clipped_percentiles: list[Percentile] = []
+                was_clipped = False
+                for p in percentile_list:
+                    original_value = p.value
+                    clipped_value = max(question.lower_bound, min(question.upper_bound, p.value))
+                    if clipped_value != original_value:
+                        was_clipped = True
+                        logger.warning(
+                            f"Clipped percentile {p.percentile} from {original_value} to {clipped_value} "
+                            f"to stay within bounds [{question.lower_bound}, {question.upper_bound}] "
+                            f"for question {question.page_url}"
+                        )
+                    clipped_percentiles.append(Percentile(percentile=p.percentile, value=clipped_value))
+
+                prediction = NumericDistribution.from_question(clipped_percentiles, question)
+
+                if was_clipped and attempt == 0:
+                    logger.warning(f"Retrying forecast for {question.page_url} due to bound violation")
+                    prompt += clean_indents(
+                        f"""
+                        WARNING: Your previous forecast violated the question's bounds.
+                        LOWER BOUND: {question.lower_bound} {question.unit_of_measure} (absolute minimum)
+                        UPPER BOUND: {question.upper_bound} {question.unit_of_measure} (absolute maximum)
+                        ALL percentiles MUST stay within these bounds. Revise your forecast accordingly.
+                        """
+                    )
+                    continue  # retry
+
+                logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
+                return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+            except AssertionError as e:
+                last_error = e
+                logger.warning(
+                    f"Bound violation on attempt {attempt+1} for {question.page_url}: {e}. Retrying..."
+                )
+                if attempt < max_retries - 1:
+                    prompt += clean_indents(
+                        f"""
+                        CRITICAL REMINDER: Your forecast MUST respect these absolute bounds:
+                        - Minimum possible value: {question.lower_bound} {question.unit_of_measure}
+                        - Maximum possible value: {question.upper_bound} {question.unit_of_measure}
+                        All percentiles (10, 20, 40, 60, 80, 90) MUST be within this range.
+                        """
+                    )
+                continue
+
+        logger.error(
+            f"Failed to generate valid numeric forecast after {max_retries} attempts for {question.page_url}. "
+            f"Using safe fallback distribution within bounds. Last error: {last_error}"
         )
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning,
-            list[Percentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
+
+        safe_percentiles = [
+            Percentile(percentile=10, value=question.lower_bound),
+            Percentile(percentile=20, value=question.lower_bound * 0.8 + question.upper_bound * 0.2),
+            Percentile(percentile=40, value=question.lower_bound * 0.6 + question.upper_bound * 0.4),
+            Percentile(percentile=60, value=question.lower_bound * 0.4 + question.upper_bound * 0.6),
+            Percentile(percentile=80, value=question.lower_bound * 0.2 + question.upper_bound * 0.8),
+            Percentile(percentile=90, value=question.upper_bound),
+        ]
+        prediction = NumericDistribution.from_question(safe_percentiles, question)
+        reasoning = (
+            f"SAFETY FALLBACK: Generated uniform distribution within bounds "
+            f"[{question.lower_bound}, {question.upper_bound}] after {max_retries} failed attempts."
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    ##################################### DATE QUESTIONS #####################################
 
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
         upper_bound_message, lower_bound_message = self._create_upper_and_lower_bound_messages(question)
+        bound_enforcement = self._create_bound_enforcement_message(question)
+
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -739,74 +933,148 @@ class SpringTemplateBot2026(ForecastBot):
 
             {lower_bound_message}
             {upper_bound_message}
+            {bound_enforcement}
 
             Formatting Instructions:
             - This is a date question, and as such, the answer must be expressed in terms of dates.
             - The dates must be written in the format of YYYY-MM-DD. If hours matter, please append the date with the hour in UTC and military time: YYYY-MM-DDTHH:MM:SSZ. No other formatting is allowed.
+            - ALWAYS ensure your dates stay STRICTLY within the bounds above.
             - Always start with a lower date chronologically and then increase from there.
-            - The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
+            - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
             (b) The outcome if nothing changed.
             (c) The outcome if the current trend continued.
             (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (e) A brief description of an unexpected scenario that results in an early outcome (but STILL after the lower bound).
+            (f) A brief description of an unexpected scenario that results in a late outcome (but STILL before the upper bound).
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns, BUT NEVER violate the hard date bounds of the question.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: YYYY-MM-DD (oldest date)
+            Percentile 10: YYYY-MM-DD (oldest date, MUST be >= lower bound)
             Percentile 20: YYYY-MM-DD
             Percentile 40: YYYY-MM-DD
             Percentile 60: YYYY-MM-DD
             Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD (newest date)
+            Percentile 90: YYYY-MM-DD (newest date, MUST be <= upper bound)
             "
             """
         )
         return await self._date_prompt_to_forecast(question, prompt)
 
     async def _date_prompt_to_forecast(
-        self, question: DateQuestion, prompt: str
+        self,
+        question: DateQuestion,
+        prompt: str,
+        max_retries: int = 3,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            The text given to you is trying to give a forecast distribution for a date question.
-            - This text is trying to answer the question: "{question.question_text}".
-            - The output is given as dates/times please format it into a valid datetime parsable string. Assume midnight UTC if no hour is given.
-            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
-            """
-        )
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning,
-            list[DatePercentile],
-            model=self.get_llm("parser", "llm"),
-            additional_instructions=parsing_instructions,
-            num_validation_samples=self._structure_output_validation_samples,
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                reasoning = await self.get_llm("default", "llm").invoke(prompt)
+                logger.info(f"Reasoning for URL {question.page_url} (attempt {attempt+1}): {reasoning}")
+
+                parsing_instructions = clean_indents(
+                    f"""
+                    The text given to you is trying to give a forecast distribution for a date question.
+                    - This text is trying to answer the question: "{question.question_text}".
+                    - As an example, someone else guessed that the answer will be between {question.lower_bound.date().isoformat()} and {question.upper_bound.date().isoformat()}, so the dates parsed from an answer like this would be verbatim "{question.lower_bound.date().isoformat()}" and "{question.upper_bound.date().isoformat()}".
+                    - The output is given as dates/times please format it into a valid datetime parsable string. Assume midnight UTC if no hour is given.
+                    - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
+                    - CRITICAL: All dates MUST be between {question.lower_bound.date().isoformat()} and {question.upper_bound.date().isoformat()}.
+                    """
+                )
+
+                date_percentile_list: list[DatePercentile] = await structure_output(
+                    reasoning,
+                    list[DatePercentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+
+                percentile_list: list[Percentile] = []
+                was_clipped = False
+                lower_ts = question.lower_bound.timestamp()
+                upper_ts = question.upper_bound.timestamp()
+
+                for dp in date_percentile_list:
+                    ts = dp.value.timestamp()
+                    clipped_ts = max(lower_ts, min(upper_ts, ts))
+                    if clipped_ts != ts:
+                        was_clipped = True
+                        logger.warning(
+                            f"Clipped date percentile {dp.percentile} from {dp.value.isoformat()} to "
+                            f"{datetime.fromtimestamp(clipped_ts, tz=timezone.utc).isoformat()} "
+                            f"to stay within bounds [{question.lower_bound.isoformat()}, {question.upper_bound.isoformat()}] "
+                            f"for question {question.page_url}"
+                        )
+                    percentile_list.append(Percentile(percentile=dp.percentile, value=clipped_ts))
+
+                prediction = NumericDistribution.from_question(percentile_list, question)
+
+                if was_clipped and attempt == 0:
+                    logger.warning(f"Retrying date forecast for {question.page_url} due to bound violation")
+                    prompt += clean_indents(
+                        f"""
+                        WARNING: Your previous forecast violated the question's date bounds.
+                        EARLIEST DATE: {question.lower_bound.date().isoformat()}
+                        LATEST DATE: {question.upper_bound.date().isoformat()}
+                        ALL percentiles MUST stay within these dates. Revise your forecast accordingly.
+                        """
+                    )
+                    continue
+
+                logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
+                return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+            except AssertionError as e:
+                last_error = e
+                logger.warning(f"Date bound violation on attempt {attempt+1} for {question.page_url}: {e}. Retrying...")
+                if attempt < max_retries - 1:
+                    prompt += clean_indents(
+                        f"""
+                        CRITICAL REMINDER: Your forecast MUST respect these absolute date bounds:
+                        - Earliest possible date: {question.lower_bound.date().isoformat()}
+                        - Latest possible date: {question.upper_bound.date().isoformat()}
+                        All percentiles MUST be within this date range.
+                        """
+                    )
+                continue
+
+        logger.error(
+            f"Failed to generate valid date forecast after {max_retries} attempts for {question.page_url}. "
+            f"Using safe fallback distribution within bounds. Last error: {last_error}"
         )
 
-        percentile_list = [
-            Percentile(percentile=percentile.percentile, value=percentile.value.timestamp())
-            for percentile in date_percentile_list
+        total_seconds = (question.upper_bound - question.lower_bound).total_seconds()
+        safe_percentiles = [
+            Percentile(percentile=10, value=question.lower_bound.timestamp()),
+            Percentile(percentile=20, value=question.lower_bound.timestamp() + total_seconds * 0.2),
+            Percentile(percentile=40, value=question.lower_bound.timestamp() + total_seconds * 0.4),
+            Percentile(percentile=60, value=question.lower_bound.timestamp() + total_seconds * 0.6),
+            Percentile(percentile=80, value=question.lower_bound.timestamp() + total_seconds * 0.8),
+            Percentile(percentile=90, value=question.upper_bound.timestamp()),
         ]
-        prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
+        prediction = NumericDistribution.from_question(safe_percentiles, question)
+        reasoning = (
+            f"SAFETY FALLBACK: Generated uniform date distribution within bounds "
+            f"[{question.lower_bound.date().isoformat()}, {question.upper_bound.date().isoformat()}] "
+            f"after {max_retries} failed attempts."
+        )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    # -----------------------------
-    # UPDATED: template-style bound selection + safe float coercion
-    # -----------------------------
+    ##################################### BOUNDS MESSAGES (TEMPLATE STYLE) #####################################
+
     def _create_upper_and_lower_bound_messages(
         self, question: Union[NumericQuestion, DateQuestion]
     ) -> tuple[str, str]:
         if isinstance(question, NumericQuestion):
-            # Template-style: pick nominal bounds if present, else hard bounds
             if question.nominal_upper_bound is not None:
                 upper_bound_number = question.nominal_upper_bound
             else:
@@ -817,10 +1085,8 @@ class SpringTemplateBot2026(ForecastBot):
             else:
                 lower_bound_number = question.lower_bound
 
-            # Safety: ensure float formatting (and consistency with upstream expectations)
             upper_bound_number = float(upper_bound_number)
             lower_bound_number = float(lower_bound_number)
-
             unit_of_measure = question.unit_of_measure or ""
 
         elif isinstance(question, DateQuestion):
@@ -831,24 +1097,18 @@ class SpringTemplateBot2026(ForecastBot):
             raise ValueError()
 
         if question.open_upper_bound:
-            upper_bound_message = (
-                f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
-            )
+            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
         else:
-            upper_bound_message = (
-                f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
-            )
+            upper_bound_message = f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
 
         if question.open_lower_bound:
-            lower_bound_message = (
-                f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
-            )
+            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
         else:
-            lower_bound_message = (
-                f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
-            )
+            lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
 
         return upper_bound_message, lower_bound_message
+
+    ##################################### CONDITIONAL QUESTIONS #####################################
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
@@ -881,6 +1141,8 @@ class SpringTemplateBot2026(ForecastBot):
     async def _get_question_prediction_info(
         self, question: MetaculusQuestion, research: str, question_type: str
     ) -> tuple[ReasonedPrediction[PredictionTypes | PredictionAffirmed], str]:
+        from forecasting_tools.data_models.data_organizer import DataOrganizer
+
         previous_forecasts = question.previous_forecasts
         if (
             question_type in ["parent", "child"]
@@ -907,6 +1169,8 @@ class SpringTemplateBot2026(ForecastBot):
         reasoning: ReasonedPrediction[PredictionTypes],
         question_type: str,
     ) -> str:
+        from forecasting_tools.data_models.data_organizer import DataOrganizer
+
         question_type = question_type.title()
         return clean_indents(
             f"""
