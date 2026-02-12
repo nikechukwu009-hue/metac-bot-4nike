@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import dotenv
@@ -125,7 +124,7 @@ def _coerce_int_bounds_to_float(obj: Any) -> Any:
 
 # -----------------------------
 # HARD PATCH: NumericQuestion bound coercion
-# (fixes AssertionError Upper bound is 8000000000)
+# (prevents AssertionError Upper bound is 8000000000)
 # -----------------------------
 _NUMERIC_BOUND_ATTRS = (
     "upper_bound",
@@ -295,9 +294,6 @@ async def exa_search(query: str, max_results: int = 8, max_age_hours: Optional[i
     return data.get("results", []) or []
 
 
-# -----------------------------
-# Source quality ranking for Linkup/Exa snippets (optional)
-# -----------------------------
 _HIGH_TRUST_DOMAINS = {
     "reuters.com",
     "apnews.com",
@@ -414,17 +410,9 @@ def _rank_and_format_sources(items: List[Dict], max_to_keep: int = 14) -> Tuple[
 
 
 class SpringTemplateBot2026(ForecastBot):
-    """
-    Template bot structure preserved.
-    Fix included:
-    - NumericQuestion.__post_init__ coercion to float for bounds (stops AssertionError Upper bound is ...)
-    """
-
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
-
-    ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
@@ -450,7 +438,6 @@ class SpringTemplateBot2026(ForecastBot):
 
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
-
             elif (
                 researcher == "asknews/news-summaries"
                 or researcher == "asknews/deep-research/low-depth"
@@ -458,9 +445,7 @@ class SpringTemplateBot2026(ForecastBot):
                 or researcher == "asknews/deep-research/high-depth"
             ):
                 research = await AskNewsSearcher().call_preconfigured_version(researcher, prompt)
-
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-                # Python 3.8-safe removeprefix
                 model_name = researcher[len("smart-searcher/") :] if researcher.startswith("smart-searcher/") else researcher
                 searcher = SmartSearcher(
                     model=model_name,
@@ -470,7 +455,6 @@ class SpringTemplateBot2026(ForecastBot):
                     use_advanced_filters=False,
                 )
                 research = await searcher.invoke(prompt)
-
             elif isinstance(researcher, str) and researcher == "linkup+exa":
                 q = question.question_text.strip()
                 criteria = (question.resolution_criteria or "").strip()
@@ -523,7 +507,6 @@ class SpringTemplateBot2026(ForecastBot):
                     {url_list}
                     """
                 ).strip()
-
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
@@ -532,11 +515,7 @@ class SpringTemplateBot2026(ForecastBot):
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
-    ##################################### BINARY QUESTIONS #####################################
-
-    async def _run_forecast_on_binary(
-        self, question: BinaryQuestion, research: str
-    ) -> ReasonedPrediction[float]:
+    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
         prompt = clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -571,9 +550,7 @@ class SpringTemplateBot2026(ForecastBot):
         )
         return await self._binary_prompt_to_forecast(question, prompt)
 
-    async def _binary_prompt_to_forecast(
-        self, question: BinaryQuestion, prompt: str
-    ) -> ReasonedPrediction[float]:
+    async def _binary_prompt_to_forecast(self, question: BinaryQuestion, prompt: str) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
@@ -585,8 +562,6 @@ class SpringTemplateBot2026(ForecastBot):
         decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
         logger.info(f"Forecasted URL {question.page_url} with prediction: {decimal_pred}.")
         return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
-
-    ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -652,8 +627,6 @@ class SpringTemplateBot2026(ForecastBot):
         )
         logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}.")
         return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
-
-    ##################################### NUMERIC QUESTIONS #####################################
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -741,8 +714,6 @@ class SpringTemplateBot2026(ForecastBot):
         logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    ##################################### DATE QUESTIONS #####################################
-
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
     ) -> ReasonedPrediction[NumericDistribution]:
@@ -828,13 +799,30 @@ class SpringTemplateBot2026(ForecastBot):
         logger.info(f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}.")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
+    # -----------------------------
+    # UPDATED: template-style bound selection + safe float coercion
+    # -----------------------------
     def _create_upper_and_lower_bound_messages(
         self, question: Union[NumericQuestion, DateQuestion]
     ) -> tuple[str, str]:
         if isinstance(question, NumericQuestion):
-            upper_bound_number = float(question.nominal_upper_bound) if question.nominal_upper_bound is not None else float(question.upper_bound)
-            lower_bound_number = float(question.nominal_lower_bound) if question.nominal_lower_bound is not None else float(question.lower_bound)
-            unit_of_measure = question.unit_of_measure
+            # Template-style: pick nominal bounds if present, else hard bounds
+            if question.nominal_upper_bound is not None:
+                upper_bound_number = question.nominal_upper_bound
+            else:
+                upper_bound_number = question.upper_bound
+
+            if question.nominal_lower_bound is not None:
+                lower_bound_number = question.nominal_lower_bound
+            else:
+                lower_bound_number = question.lower_bound
+
+            # Safety: ensure float formatting (and consistency with upstream expectations)
+            upper_bound_number = float(upper_bound_number)
+            lower_bound_number = float(lower_bound_number)
+
+            unit_of_measure = question.unit_of_measure or ""
+
         elif isinstance(question, DateQuestion):
             upper_bound_number = question.upper_bound.date().isoformat()
             lower_bound_number = question.lower_bound.date().isoformat()
@@ -843,17 +831,24 @@ class SpringTemplateBot2026(ForecastBot):
             raise ValueError()
 
         if question.open_upper_bound:
-            upper_bound_message = f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
+            upper_bound_message = (
+                f"The question creator thinks the number is likely not higher than {upper_bound_number} {unit_of_measure}."
+            )
         else:
-            upper_bound_message = f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
+            upper_bound_message = (
+                f"The outcome can not be higher than {upper_bound_number} {unit_of_measure}."
+            )
 
         if question.open_lower_bound:
-            lower_bound_message = f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
+            lower_bound_message = (
+                f"The question creator thinks the number is likely not lower than {lower_bound_number} {unit_of_measure}."
+            )
         else:
-            lower_bound_message = f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
-        return upper_bound_message, lower_bound_message
+            lower_bound_message = (
+                f"The outcome can not be lower than {lower_bound_number} {unit_of_measure}."
+            )
 
-    ##################################### CONDITIONAL QUESTIONS #####################################
+        return upper_bound_message, lower_bound_message
 
     async def _run_forecast_on_conditional(
         self, question: ConditionalQuestion, research: str
