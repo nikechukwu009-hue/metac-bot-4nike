@@ -50,7 +50,7 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/openrouter/free"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/openai/gpt-5.4"
 )
 OPENROUTER_PARSER_MODEL = os.getenv(
     "OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL
