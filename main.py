@@ -62,26 +62,25 @@ LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search"
 EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
-# FIX 6 – configurable recursion depth guard for bound-coercion traversal
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
 MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
 
-# IMPROVEMENT I – named constants for safe-fallback interpolation points
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 _FALLBACK_PERCENTILES = (10, 20, 40, 60, 80, 90)
 
-# Forecasting improvement 3 – calibration temperature scaling.
-# Values < 1.0 pull predictions toward 0.5 (reduce overconfidence).
-# Set to 1.0 to disable.  Tune empirically against held-out Brier scores.
-CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "0.85"))
+# CHANGED: No shrinkage toward 0.5. We want decisive forecasts.
+# Set < 1.0 only if you observe severe overconfidence in Brier score post-hoc.
+CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.0"))
 
-# Forecasting improvement 7 – early-stop binary sampling.
-# If the std-dev of log-odds across the first 3 predictions is <= this value,
-# skip the remaining runs entirely.
+# NEW: Extremization factor applied AFTER log-odds aggregation across runs.
+# Pushes the consensus prediction further from 0.5, rewarding confident calls.
+# 1.25 means a 70% forecast becomes ~76%, a 90% forecast becomes ~96%.
+# Tune down toward 1.0 if Brier scores worsen empirically.
+EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "1.25"))
+
 EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
 
-# Forecasting improvement 9 – JSONL run log path (empty string disables).
 RUN_LOG_PATH: str = os.getenv("RUN_LOG_PATH", "nike_bot_run_log.jsonl")
 
 _WS_RE = re.compile(r"\s+")
@@ -109,7 +108,6 @@ def _looks_like_bound_key(k: Any) -> bool:
 
 
 def _to_float_if_int_like(v: Any) -> Any:
-    """Convert int/Decimal/numeric strings to float where possible."""
     if isinstance(v, int):
         return float(v)
     if isinstance(v, Decimal):
@@ -130,11 +128,6 @@ def _to_float_if_int_like(v: Any) -> Any:
 
 
 def _coerce_int_bounds_to_float(obj: Any, _depth: int = 0) -> Any:
-    """
-    Recursively convert *bound* fields to float.
-
-    FIX 6 – guards against unbounded recursion on pathological payloads.
-    """
     if _depth > MAX_COERCE_DEPTH:
         return obj
     if isinstance(obj, dict):
@@ -168,7 +161,7 @@ def _coerce_to_float(v: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# HARD PATCH 1: NumericQuestion bound coercion (object-level)
+# HARD PATCH 1: NumericQuestion bound coercion
 # ---------------------------------------------------------------------------
 _NUMERIC_BOUND_ATTRS = (
     "upper_bound",
@@ -192,8 +185,6 @@ NumericQuestion.__post_init__ = _patched_numeric_post_init  # type: ignore
 
 # ---------------------------------------------------------------------------
 # HARD PATCH 2: Metaculus client ingestion path
-# FIX 1 – classmethod wrapper now correctly threads `cls` as first positional arg.
-# FIX 3 – uses inspect.isawaitable instead of asyncio.iscoroutine.
 # ---------------------------------------------------------------------------
 def _monkeypatch_metaculus_client_ingestion() -> None:
     try:
@@ -215,7 +206,6 @@ def _monkeypatch_metaculus_client_ingestion() -> None:
                 for k, v in kwargs.items()
             }
             result = fn(*new_args, **new_kwargs)
-            # FIX 3 – isawaitable covers coroutines, Tasks, and custom awaitables
             return await result if inspect.isawaitable(result) else result
 
         _aw.__name__ = getattr(fn, "__name__", "wrapped_async")
@@ -243,8 +233,6 @@ def _monkeypatch_metaculus_client_ingestion() -> None:
             else _make_sync_wrapper(fn)
         )
 
-    # Patch DataOrganizer.get_question_from_post_json
-    # FIX 1 – wrap __func__ then re-wrap as classmethod so `cls` is preserved.
     try:
         from forecasting_tools.data_models.data_organizer import DataOrganizer  # type: ignore
 
@@ -262,7 +250,6 @@ def _monkeypatch_metaculus_client_ingestion() -> None:
     except Exception as exc:
         logger.warning("Could not patch DataOrganizer: %s", exc)
 
-    # Patch free functions in the module
     _CANDIDATE_NAMES = {
         "_process_post",
         "process_post",
@@ -295,7 +282,6 @@ def _monkeypatch_metaculus_client_ingestion() -> None:
             except Exception:
                 pass
 
-    # Patch MetaculusClient methods
     try:
         cls = getattr(mc, "MetaculusClient", None)
         if cls is not None:
@@ -328,15 +314,8 @@ _monkeypatch_metaculus_client_ingestion()
 
 # ---------------------------------------------------------------------------
 # PatchedMetaculusClient
-# FIX 3 – uses inspect.isawaitable instead of asyncio.iscoroutine.
-# IMPROVEMENT 8 – tournament slug validation before forecasting starts.
 # ---------------------------------------------------------------------------
 class PatchedMetaculusClient(MetaculusClient):
-    """
-    Thin subclass that coerces bounds and provides stable tournament-retrieval
-    aliases across different forecasting_tools versions.
-    """
-
     def _post_json_to_questions_while_handling_groups(
         self, post_json_from_api: Any, group_question_mode: Any = None
     ) -> Any:
@@ -371,16 +350,12 @@ class PatchedMetaculusClient(MetaculusClient):
             fn = getattr(super(), name, None)
             if callable(fn):
                 result = fn(tournament_id_or_slug)
-                # FIX 3
                 return await result if inspect.isawaitable(result) else result
         raise AttributeError(
-            "Could not find a tournament retrieval method on MetaculusClient. "
-            "Tried: get_all_open_questions_from_tournament, "
-            "get_open_questions_from_tournament."
+            "Could not find a tournament retrieval method on MetaculusClient."
         )
 
     async def validate_tournament_slug(self, slug: str) -> bool:
-        """Eagerly validate a slug so failures surface before other tournaments run."""
         try:
             questions = await self._get_open_tournament_questions(slug)
             return isinstance(questions, list)
@@ -535,11 +510,9 @@ def _rank_and_format_sources(
 
 
 # ---------------------------------------------------------------------------
-# IMPROVEMENT A – lightweight in-run question cache
+# In-run question cache
 # ---------------------------------------------------------------------------
 class QuestionCache:
-    """Avoids fetching the same Metaculus question URL twice in one run."""
-
     def __init__(self) -> None:
         self._cache: Dict[str, MetaculusQuestion] = {}
 
@@ -554,40 +527,37 @@ class QuestionCache:
 
 
 # ---------------------------------------------------------------------------
-# Forecasting improvement 1+2 – aggregation helpers
+# Aggregation helpers
 # ---------------------------------------------------------------------------
 
 def _to_log_odds(p: float) -> float:
-    """Convert probability to log-odds, clamped to avoid ±inf."""
     p = max(1e-6, min(1 - 1e-6, p))
     return math.log(p / (1.0 - p))
 
 
 def _from_log_odds(lo: float) -> float:
-    """Convert log-odds back to probability."""
     return 1.0 / (1.0 + math.exp(-lo))
 
 
 def _aggregate_binary_predictions(probs: List[float]) -> float:
     """
-    Improvement 1 – log-odds mean, then calibration scaling.
-    A flat arithmetic mean is biased; averaging in log-odds space is more
-    principled and naturally down-weights extreme outliers.
+    Log-odds mean, then optional calibration scale, then extremization.
+    CALIBRATION_SCALE=1.0 (default) means no regression toward 0.5.
+    EXTREMIZE_SCALE>1.0 pushes the aggregate further from 0.5 after merging.
     """
     if not probs:
         return 0.5
     mean_lo = statistics.mean(_to_log_odds(p) for p in probs)
-    raw = _from_log_odds(mean_lo)
-    # Improvement 3 – pull toward 0.5 to correct LLM overconfidence
-    calibrated = 0.5 + (raw - 0.5) * CALIBRATION_SCALE
-    return max(0.01, min(0.99, calibrated))
+    # Calibration (default: no-op at 1.0)
+    calibrated_lo = mean_lo * CALIBRATION_SCALE
+    raw = _from_log_odds(calibrated_lo)
+    # Extremization: stretch away from 0.5 in log-odds space
+    extremized_lo = calibrated_lo * EXTREMIZE_SCALE
+    extremized = _from_log_odds(extremized_lo)
+    return max(0.01, min(0.99, extremized))
 
 
 def _trimmed_mean(values: List[float]) -> float:
-    """
-    Improvement 2 – drop the single highest and lowest value, then average.
-    Falls back to a plain mean when fewer than 4 values are present.
-    """
     if len(values) < 4:
         return statistics.mean(values)
     trimmed = sorted(values)[1:-1]
@@ -595,20 +565,13 @@ def _trimmed_mean(values: List[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Forecasting improvement 4 – monotone percentile sort
+# Monotone percentile sort
 # ---------------------------------------------------------------------------
 
 def _sort_percentiles_monotone(percentile_list: List[Percentile]) -> List[Percentile]:
-    """
-    Sort percentiles by percentile number and ensure values are non-decreasing.
-    The model sometimes outputs out-of-order values; fixing them before clipping
-    avoids producing a distribution that violates P10 < P20 < ... < P90.
-    """
     if not percentile_list:
         return percentile_list
-    # Sort by percentile label
     ordered = sorted(percentile_list, key=lambda p: p.percentile)
-    # Ensure values are non-decreasing (forward pass)
     for i in range(1, len(ordered)):
         if ordered[i].value < ordered[i - 1].value:
             ordered[i] = Percentile(
@@ -618,17 +581,12 @@ def _sort_percentiles_monotone(percentile_list: List[Percentile]) -> List[Percen
 
 
 # ---------------------------------------------------------------------------
-# Forecasting improvement 6 – community-prediction fallback helper
+# Community-prediction fallback helper
 # ---------------------------------------------------------------------------
 
 def _community_numeric_percentiles(
     community_pred: Any, lo: float, hi: float
 ) -> List[Percentile]:
-    """
-    Build a narrow distribution centred on the community prediction rather than
-    a wide uniform fallback.  We use a ±20 % spread around the community value,
-    clamped to [lo, hi].  This will almost always score better than a flat uniform.
-    """
     try:
         centre = float(community_pred)
     except (TypeError, ValueError):
@@ -646,15 +604,10 @@ def _community_numeric_percentiles(
 
 
 # ---------------------------------------------------------------------------
-# Forecasting improvement 9 – JSONL run logger
+# JSONL run logger
 # ---------------------------------------------------------------------------
 
 class RunLogger:
-    """
-    Appends a structured JSON record per question to a .jsonl file.
-    Set RUN_LOG_PATH="" to disable entirely.
-    """
-
     def __init__(self, path: str) -> None:
         self._path: Optional[pathlib.Path] = pathlib.Path(path) if path else None
 
@@ -671,6 +624,52 @@ class RunLogger:
 _run_logger = RunLogger(RUN_LOG_PATH)
 
 
+# ---------------------------------------------------------------------------
+# Reasoning compressor — trims verbose LLM output for Metaculus comments
+# ---------------------------------------------------------------------------
+
+async def _compress_reasoning(
+    llm: GeneralLlm,
+    full_reasoning: str,
+    question_text: str,
+    final_prediction_str: str,
+) -> str:
+    """
+    Distils the full chain-of-thought into ≤3 tight sentences suitable for a
+    Metaculus comment. No model names, no hedging boilerplate, no preamble.
+    """
+    prompt = clean_indents(
+        f"""
+        You are editing a forecaster's reasoning note for a public comment.
+
+        Question: {question_text}
+        Final prediction: {final_prediction_str}
+
+        Full reasoning:
+        {full_reasoning[:3000]}
+
+        Write exactly 2-3 sentences that:
+        1. State the single most decisive piece of evidence from the research.
+        2. Briefly name the main counter-risk.
+        3. State the conclusion and confidence in plain language.
+
+        Rules:
+        - No model names, no tool names, no "my research assistant says".
+        - No hedging phrases like "it's hard to say" or "I could be wrong".
+        - No bullet points, headers, or markdown.
+        - Start directly with the evidence, not with "The question asks..." or "Based on...".
+        """
+    )
+    try:
+        compressed = await llm.invoke(prompt)
+        # Strip any accidental preamble lines
+        lines = [l.strip() for l in compressed.strip().splitlines() if l.strip()]
+        return " ".join(lines[:5])  # cap at 5 sentences just in case
+    except Exception as exc:
+        logger.warning("Reasoning compression failed: %s", exc)
+        # Fallback: first 300 chars of original
+        return full_reasoning.strip()[:300]
+
 
 # ---------------------------------------------------------------------------
 # NikeBot
@@ -679,28 +678,26 @@ class NikeBot(ForecastBot):
     """
     Nike Bot — Just Forecast It.
 
-    A production-grade Metaculus forecasting bot with:
-    - Binary, multiple-choice, numeric, date, and conditional question support.
-    - Pluggable researcher backends (GeneralLlm, AskNews, SmartSearcher, linkup+exa).
-    - Robust bound enforcement with automatic retry + safe fallback.
-    - Per-question timing metrics.
-    - Optional dry-run mode (research only, no publishing).
+    Optimised for high Brier scores on Minibench and AI tournament:
+    - Extremization after log-odds aggregation (EXTREMIZE_SCALE > 1.0).
+    - No regression toward 0.5 (CALIBRATION_SCALE = 1.0).
+    - Bold update instruction in binary prompt: follow the evidence hard.
+    - Compressed, model-agnostic reasoning published to Metaculus.
+    - Per-question timing, JSONL run log, community prediction fallback.
     """
 
     _max_concurrent_questions: int = 1
 
-    # FIX 4 – Semaphore created in __init__, never at class definition time.
     def __init__(self, *args: Any, dry_run: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._concurrency_limiter = asyncio.Semaphore(self._max_concurrent_questions)
         self._structure_output_validation_samples = 2
         self.dry_run = dry_run
         self._question_cache = QuestionCache()
-        # Improvement 7 – per-question binary prediction accumulator (reset each question)
         self._binary_preds_this_question: List[float] = []
 
     # -------------------------------------------------------------------------
-    # IMPROVEMENT B – DRY retry-addendum builder
+    # Retry addendum builder
     # -------------------------------------------------------------------------
     @staticmethod
     def _build_retry_addendum(
@@ -728,15 +725,10 @@ class NikeBot(ForecastBot):
         )
 
     # -------------------------------------------------------------------------
-    # IMPROVEMENT C – single source of truth for safe-fallback percentile maths
+    # Safe fallback percentile helper
     # -------------------------------------------------------------------------
     @staticmethod
     def _safe_fallback_percentiles(lo: float, hi: float) -> List[Percentile]:
-        """
-        Returns six evenly-spaced percentiles between lo and hi.
-        _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) maps to percentiles
-        (10, 20, 40, 60, 80, 90) — the same six points used throughout the bot.
-        """
         return [
             Percentile(percentile=pct, value=lo + (hi - lo) * frac)
             for pct, frac in zip(_FALLBACK_PERCENTILES, _FALLBACK_FRACS)
@@ -766,7 +758,6 @@ class NikeBot(ForecastBot):
             )
             research = await self._dispatch_research(question, prompt)
             logger.info("Research for %s:\n%s", question.page_url, research)
-            # Improvement 9 – log research to JSONL
             _run_logger.log({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "url": question.page_url,
@@ -778,10 +769,6 @@ class NikeBot(ForecastBot):
     async def _dispatch_research(
         self, question: MetaculusQuestion, prompt: str
     ) -> str:
-        """
-        IMPROVEMENT H – extracted dispatcher keeps run_research readable.
-        FIX 5 – every branch is explicit; no ambiguous fall-through to get_llm().
-        """
         researcher = self.get_llm("researcher")
 
         if isinstance(researcher, GeneralLlm):
@@ -828,8 +815,6 @@ class NikeBot(ForecastBot):
         q = question.question_text.strip()
         criteria = (question.resolution_criteria or "").strip()
         query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
-        # Improvement 5 – third query: resolution criteria keywords alone,
-        # deliberately excluding the question text to surface different sources.
         query_criteria_only = criteria[:700] if criteria else q
 
         linkup_1, linkup_2, exa_1, exa_2, exa_3 = await asyncio.gather(
@@ -837,14 +822,14 @@ class NikeBot(ForecastBot):
             linkup_search(query_resolution, max_results=6, depth="deep"),
             exa_search(q, max_results=10),
             exa_search(query_resolution, max_results=8),
-            exa_search(query_criteria_only, max_results=6),  # Improvement 5
+            exa_search(query_criteria_only, max_results=6),
         )
         combined: List[Dict[str, Any]] = [
             *(linkup_1 or []),
             *(linkup_2 or []),
             *(exa_1 or []),
             *(exa_2 or []),
-            *(exa_3 or []),  # Improvement 5
+            *(exa_3 or []),
         ]
         sources_block, urls = _rank_and_format_sources(combined, max_to_keep=14)
 
@@ -887,37 +872,43 @@ class NikeBot(ForecastBot):
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        # Improvement 7 – reset accumulator at the start of each new question
         self._binary_preds_this_question = []
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a professional forecaster with a strong track record.
+            Your job is to produce a well-calibrated but decisive probability estimate.
 
-            Your interview question is:
+            Question:
             {question.question_text}
 
-            Question background:
+            Background:
             {question.background_info}
 
-            This question's outcome will be determined by the specific criteria below.
-            These criteria have not yet been satisfied:
+            Resolution criteria (not yet satisfied):
             {question.resolution_criteria}
 
             {question.fine_print}
 
-            Your research assistant says:
+            Research findings:
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
+            Before stating your probability, write briefly:
+            (a) Time remaining until resolution.
+            (b) The status quo outcome if nothing changes.
+            (c) The strongest evidence pointing toward YES.
+            (d) The strongest evidence pointing toward NO.
+            (e) Your overall read: which way does the evidence lean, and how strongly?
 
-            You write your rationale remembering that good forecasters put extra weight on
-            the status quo outcome since the world changes slowly most of the time.
+            IMPORTANT INSTRUCTIONS:
+            - If the research clearly supports one outcome, reflect that clearly in your
+              probability. Do not hedge excessively — a 55% when evidence strongly points
+              one way is a poor forecast.
+            - If you assess >75% likelihood, say so. If <25%, say so.
+            - Good forecasters put extra weight on the status quo, but update hard when
+              evidence demands it.
+            - Avoid anchoring on 50% without a strong reason.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -928,21 +919,6 @@ class NikeBot(ForecastBot):
     async def _binary_prompt_to_forecast(
         self, question: BinaryQuestion, prompt: str
     ) -> ReasonedPrediction[float]:
-        """
-        Improvements 1, 3, 7, 8, 9 applied here.
-
-        Improvement 7 – adaptive early stopping: accumulate per-run predictions
-        in self._binary_preds_this_question (reset by _run_forecast_on_binary).
-        After the 3rd prediction, if the std-dev of log-odds is small we skip
-        remaining runs and the base class will use whatever we return.
-
-        Improvement 8 – the retry addendum is prepended, not appended, so it
-        appears near the top of the context.
-
-        The base ForecastBot calls _run_forecast_on_binary N times
-        (predictions_per_research_report) and aggregates. We override
-        aggregation in _aggregate_binary_run_predictions below.
-        """
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info("Reasoning for %s: %s", question.page_url, reasoning)
         binary_prediction: BinaryPrediction = await structure_output(
@@ -953,11 +929,11 @@ class NikeBot(ForecastBot):
         )
         raw_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
 
-        # Improvement 3 – apply calibration scaling toward 0.5
+        # Calibration (default: no-op at scale 1.0)
         calibrated = 0.5 + (raw_pred - 0.5) * CALIBRATION_SCALE
         decimal_pred = max(0.01, min(0.99, calibrated))
 
-        # Improvement 7 – accumulate for early-stop check
+        # Per-run accumulation for early-stop check
         self._binary_preds_this_question.append(decimal_pred)
         n = len(self._binary_preds_this_question)
         if n >= 3:
@@ -969,9 +945,17 @@ class NikeBot(ForecastBot):
                     question.page_url, n, spread,
                 )
 
-        logger.info("Forecast for %s: %.4f (calibrated from %.4f)", question.page_url, decimal_pred, raw_pred)
+        # Compress reasoning for Metaculus before logging
+        compressed = await _compress_reasoning(
+            self.get_llm("default", "llm"),
+            reasoning,
+            question.question_text,
+            f"{decimal_pred*100:.1f}%",
+        )
 
-        # Improvement 9 – log to JSONL
+        logger.info(
+            "Forecast for %s: %.4f (from raw %.4f)", question.page_url, decimal_pred, raw_pred
+        )
         _run_logger.log({
             "ts": datetime.now(timezone.utc).isoformat(),
             "url": question.page_url,
@@ -980,9 +964,10 @@ class NikeBot(ForecastBot):
             "raw_pred": raw_pred,
             "calibrated_pred": decimal_pred,
             "reasoning_snippet": reasoning[:500],
+            "compressed_reasoning": compressed,
         })
 
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=compressed)
 
     # -------------------------------------------------------------------------
     # Multiple-choice questions
@@ -992,12 +977,12 @@ class NikeBot(ForecastBot):
     ) -> ReasonedPrediction[PredictedOptionList]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a professional forecaster with a strong track record.
 
-            Your interview question is:
+            Question:
             {question.question_text}
 
-            The options are: {question.options}
+            Options: {question.options}
 
             Background:
             {question.background_info}
@@ -1006,21 +991,23 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Your research assistant says:
+            Research findings:
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of a scenario that results in an unexpected outcome.
+            Before stating probabilities, write briefly:
+            (a) Time remaining until resolution.
+            (b) The status quo outcome if nothing changes.
+            (c) One scenario that would produce a surprising outcome.
 
+            IMPORTANT INSTRUCTIONS:
+            - If evidence strongly favours one option, reflect that in the probabilities.
+              Avoid artificially spreading mass across all options when evidence is clear.
+            - Keep some residual probability on each option for genuine uncertainty, but
+              do not sacrifice sharpness — a 50% when evidence says 80% is a poor forecast.
+            - Good forecasters put extra weight on the status quo but update hard on evidence.
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You write your rationale remembering that (1) good forecasters put extra weight
-            on the status quo outcome since the world changes slowly most of the time, and
-            (2) good forecasters leave some moderate probability on most options to account
-            for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this
             order {question.options} as:
@@ -1056,9 +1043,16 @@ class NikeBot(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
+        # Compress for Metaculus
+        compressed = await _compress_reasoning(
+            self.get_llm("default", "llm"),
+            reasoning,
+            question.question_text,
+            str(predicted_option_list),
+        )
         logger.info("Forecast for %s: %s", question.page_url, predicted_option_list)
         return ReasonedPrediction(
-            prediction_value=predicted_option_list, reasoning=reasoning
+            prediction_value=predicted_option_list, reasoning=compressed
         )
 
     # -------------------------------------------------------------------------
@@ -1099,8 +1093,6 @@ class NikeBot(ForecastBot):
 
     # -------------------------------------------------------------------------
     # Numeric questions
-    # FIX 2 – retry logic is unambiguous (clip → retry once → accept or fallback).
-    # IMPROVEMENT C – safe fallback uses shared helper.
     # -------------------------------------------------------------------------
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -1110,9 +1102,9 @@ class NikeBot(ForecastBot):
 
         base_prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a professional forecaster with a strong track record.
 
-            Your interview question is:
+            Question:
             {question.question_text}
 
             Background:
@@ -1122,9 +1114,9 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Units for answer: {question.unit_of_measure or "Not stated (please infer this)"}
+            Units: {question.unit_of_measure or "Not stated (please infer this)"}
 
-            Your research assistant says:
+            Research findings:
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
@@ -1134,30 +1126,33 @@ class NikeBot(ForecastBot):
             {bound_enforcement}
 
             Formatting Instructions:
-            - Notice the units and give your answer in those units.
+            - Give your answer in the stated units.
             - Never use scientific notation.
             - Percentile values must be strictly increasing (10 < 20 < 40 < 60 < 80 < 90).
             - ALWAYS ensure values stay STRICTLY within the bounds above.
 
-            Before answering you write:
-            (a) Time left until the outcome is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) Expectations of experts and markets.
-            (e) A low-outcome scenario (STILL above the lower bound).
-            (f) A high-outcome scenario (STILL below the upper bound).
+            Before stating percentiles, write briefly:
+            (a) Time remaining.
+            (b) The outcome if nothing changes.
+            (c) The outcome if the current trend continues.
+            (d) Expert / market expectations.
+            (e) A plausible low outcome (still above lower bound).
+            (f) A plausible high outcome (still below upper bound).
+
+            IMPORTANT: If research clearly points to a specific range, your percentiles
+            should reflect that — don't spread mass uniformly across the full range when
+            evidence narrows it.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Good forecasters set wide 90/10 confidence intervals but NEVER violate hard bounds.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: XX  (>= lower bound)
+            Percentile 10: XX
             Percentile 20: XX
             Percentile 40: XX
             Percentile 60: XX
             Percentile 80: XX
-            Percentile 90: XX  (<= upper bound)
+            Percentile 90: XX
             "
             """
         )
@@ -1169,12 +1164,6 @@ class NikeBot(ForecastBot):
         prompt: str,
         max_retries: int = 3,
     ) -> ReasonedPrediction[NumericDistribution]:
-        """
-        FIX 2 – Unambiguous retry policy:
-          Attempt 0   : generate → clip if needed → append addendum → always retry.
-          Attempts 1+ : generate → clip if needed → accept (warn) or return clean.
-          All retries exhausted → safe uniform fallback.
-        """
         last_error: Optional[Exception] = None
 
         for attempt in range(max_retries):
@@ -1190,11 +1179,10 @@ class NikeBot(ForecastBot):
                     The text is a forecast distribution for a numeric question.
                     Question: "{question.question_text}"
                     Units: {question.unit_of_measure}
-                    Example bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
-                    - Parse values in the correct units (convert if needed).
+                    Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
+                    - Parse values in the correct units.
                     - No scientific notation.
                     - NEVER return values outside [{question.lower_bound}, {question.upper_bound}].
-                    - If percentiles are not explicitly given, indicate that instead of guessing.
                     """
                 )
 
@@ -1206,39 +1194,36 @@ class NikeBot(ForecastBot):
                     num_validation_samples=self._structure_output_validation_samples,
                 )
 
-                # Improvement 4 – enforce monotonicity before clipping
                 percentile_list = _sort_percentiles_monotone(percentile_list)
-
                 clipped, was_clipped = self._clip_numeric_percentiles(
                     percentile_list, question
                 )
 
                 if was_clipped:
                     logger.warning(
-                        "Numeric percentile clipping on attempt %d for %s",
-                        attempt + 1, question.page_url,
+                        "Numeric clipping on attempt %d for %s", attempt + 1, question.page_url
                     )
                     if attempt < max_retries - 1:
-                        # Improvement 8 – prepend addendum so it's near top of context
                         addendum = self._build_retry_addendum(
                             question.lower_bound,
                             question.upper_bound,
                             question.unit_of_measure or "",
                         )
                         prompt = addendum + "\n\n" + prompt
-                        continue  # retry with addendum
-                    # Final attempt: accept clipped result with a warning
+                        continue
                     logger.warning(
                         "Accepting clipped numeric result for %s after %d attempts.",
                         question.page_url, attempt + 1,
                     )
 
                 prediction = NumericDistribution.from_question(clipped, question)
-                logger.info(
-                    "Numeric forecast for %s: %s",
-                    question.page_url, prediction.declared_percentiles,
+                compressed = await _compress_reasoning(
+                    self.get_llm("default", "llm"),
+                    reasoning,
+                    question.question_text,
+                    f"P10={clipped[0].value if clipped else '?'}, P90={clipped[-1].value if clipped else '?'}",
                 )
-                # Improvement 9 – JSONL run log
+                logger.info("Numeric forecast for %s: %s", question.page_url, prediction.declared_percentiles)
                 _run_logger.log({
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "url": question.page_url,
@@ -1248,7 +1233,7 @@ class NikeBot(ForecastBot):
                     "reasoning_snippet": reasoning[:500],
                 })
                 return ReasonedPrediction(
-                    prediction_value=prediction, reasoning=reasoning
+                    prediction_value=prediction, reasoning=compressed
                 )
 
             except AssertionError as exc:
@@ -1258,7 +1243,6 @@ class NikeBot(ForecastBot):
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
-                    # Improvement 8 – prepend
                     addendum = self._build_retry_addendum(
                         question.lower_bound,
                         question.upper_bound,
@@ -1267,19 +1251,13 @@ class NikeBot(ForecastBot):
                     prompt = addendum + "\n\n" + prompt
 
         logger.error(
-            "All %d numeric attempts failed for %s. Using safe fallback. Last error: %s",
+            "All %d numeric attempts failed for %s. Last error: %s",
             max_retries, question.page_url, last_error,
         )
-        # Improvement 6 – prefer community prediction over raw uniform fallback
         community_pred = getattr(question, "community_prediction", None)
         if community_pred is not None:
-            logger.info(
-                "Using community prediction as fallback for %s", question.page_url
-            )
             safe_pcts = _community_numeric_percentiles(
-                community_pred,
-                float(question.lower_bound),
-                float(question.upper_bound),
+                community_pred, float(question.lower_bound), float(question.upper_bound)
             )
         else:
             safe_pcts = self._safe_fallback_percentiles(
@@ -1288,11 +1266,7 @@ class NikeBot(ForecastBot):
         prediction = NumericDistribution.from_question(safe_pcts, question)
         return ReasonedPrediction(
             prediction_value=prediction,
-            reasoning=(
-                f"SAFETY FALLBACK: distribution within "
-                f"[{question.lower_bound}, {question.upper_bound}] "
-                f"after {max_retries} failed attempts."
-            ),
+            reasoning=f"Uniform fallback within [{question.lower_bound}, {question.upper_bound}] after {max_retries} failed attempts.",
         )
 
     @staticmethod
@@ -1312,7 +1286,7 @@ class NikeBot(ForecastBot):
         return clipped, was_clipped
 
     # -------------------------------------------------------------------------
-    # Date questions  (FIX 2 – same unambiguous retry logic as numeric)
+    # Date questions
     # -------------------------------------------------------------------------
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
@@ -1322,9 +1296,9 @@ class NikeBot(ForecastBot):
 
         base_prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a professional forecaster with a strong track record.
 
-            Your interview question is:
+            Question:
             {question.question_text}
 
             Background:
@@ -1334,7 +1308,7 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Your research assistant says:
+            Research findings:
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
@@ -1344,31 +1318,31 @@ class NikeBot(ForecastBot):
             {bound_enforcement}
 
             Formatting Instructions:
-            - Express all answers as dates: YYYY-MM-DD.
-            - If hours matter: YYYY-MM-DDTHH:MM:SSZ (UTC). No other formats.
+            - All answers as dates: YYYY-MM-DD.
             - Dates must be strictly chronological (earliest at percentile 10).
             - ALWAYS stay STRICTLY within the bounds above.
 
-            Before answering you write:
-            (a) Time left until the outcome is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) Expectations of experts and markets.
-            (e) An early-outcome scenario (STILL after the lower bound).
-            (f) A late-outcome scenario (STILL before the upper bound).
+            Before stating percentiles, write briefly:
+            (a) Time remaining.
+            (b) The outcome if nothing changes.
+            (c) The outcome if the current trend continues.
+            (d) Expert / market expectations.
+            (e) A plausible early outcome (still after lower bound).
+            (f) A plausible late outcome (still before upper bound).
+
+            IMPORTANT: If research clearly narrows the likely date, your percentiles
+            should reflect that — don't spread uniformly when evidence is concentrated.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Good forecasters set wide 90/10 confidence intervals but NEVER violate
-            hard date bounds.
 
             The last thing you write is your final answer as:
             "
-            Percentile 10: YYYY-MM-DD  (>= lower bound)
+            Percentile 10: YYYY-MM-DD
             Percentile 20: YYYY-MM-DD
             Percentile 40: YYYY-MM-DD
             Percentile 60: YYYY-MM-DD
             Percentile 80: YYYY-MM-DD
-            Percentile 90: YYYY-MM-DD  (<= upper bound)
+            Percentile 90: YYYY-MM-DD
             "
             """
         )
@@ -1401,7 +1375,6 @@ class NikeBot(ForecastBot):
                     - Format each date as a valid parseable datetime string.
                     - Assume midnight UTC if no time is given.
                     - All dates MUST fall within the stated bounds.
-                    - If percentiles are not explicitly given, indicate that.
                     """
                 )
 
@@ -1419,11 +1392,9 @@ class NikeBot(ForecastBot):
 
                 if was_clipped:
                     logger.warning(
-                        "Date percentile clipping on attempt %d for %s",
-                        attempt + 1, question.page_url,
+                        "Date clipping on attempt %d for %s", attempt + 1, question.page_url
                     )
                     if attempt < max_retries - 1:
-                        # Improvement 8 – prepend so reminder is near top of context
                         addendum = self._build_retry_addendum(
                             question.lower_bound.date().isoformat(),
                             question.upper_bound.date().isoformat(),
@@ -1437,11 +1408,13 @@ class NikeBot(ForecastBot):
                     )
 
                 prediction = NumericDistribution.from_question(clipped, question)
-                logger.info(
-                    "Date forecast for %s: %s",
-                    question.page_url, prediction.declared_percentiles,
+                compressed = await _compress_reasoning(
+                    self.get_llm("default", "llm"),
+                    reasoning,
+                    question.question_text,
+                    f"P10={clipped[0].value if clipped else '?'}, P90={clipped[-1].value if clipped else '?'}",
                 )
-                # Improvement 9 – JSONL run log
+                logger.info("Date forecast for %s: %s", question.page_url, prediction.declared_percentiles)
                 _run_logger.log({
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "url": question.page_url,
@@ -1451,7 +1424,7 @@ class NikeBot(ForecastBot):
                     "reasoning_snippet": reasoning[:500],
                 })
                 return ReasonedPrediction(
-                    prediction_value=prediction, reasoning=reasoning
+                    prediction_value=prediction, reasoning=compressed
                 )
 
             except AssertionError as exc:
@@ -1461,7 +1434,6 @@ class NikeBot(ForecastBot):
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
-                    # Improvement 8 – prepend
                     addendum = self._build_retry_addendum(
                         question.lower_bound.date().isoformat(),
                         question.upper_bound.date().isoformat(),
@@ -1470,29 +1442,18 @@ class NikeBot(ForecastBot):
                     prompt = addendum + "\n\n" + prompt
 
         logger.error(
-            "All %d date attempts failed for %s. Using safe fallback. Last error: %s",
+            "All %d date attempts failed for %s. Last error: %s",
             max_retries, question.page_url, last_error,
         )
-        # Improvement 6 – prefer community prediction over raw uniform fallback
         community_pred = getattr(question, "community_prediction", None)
         if community_pred is not None:
-            logger.info(
-                "Using community prediction as date fallback for %s", question.page_url
-            )
-            safe_pcts = _community_numeric_percentiles(
-                community_pred, lower_ts, upper_ts
-            )
+            safe_pcts = _community_numeric_percentiles(community_pred, lower_ts, upper_ts)
         else:
             safe_pcts = self._safe_fallback_percentiles(lower_ts, upper_ts)
         prediction = NumericDistribution.from_question(safe_pcts, question)
         return ReasonedPrediction(
             prediction_value=prediction,
-            reasoning=(
-                f"SAFETY FALLBACK: date distribution within "
-                f"[{question.lower_bound.date().isoformat()}, "
-                f"{question.upper_bound.date().isoformat()}] "
-                f"after {max_retries} failed attempts."
-            ),
+            reasoning=f"Uniform fallback within date bounds after {max_retries} failed attempts.",
         )
 
     @staticmethod
@@ -1670,24 +1631,19 @@ class NikeBot(ForecastBot):
     def _get_conditional_disclaimer_if_necessary(
         self, question: MetaculusQuestion
     ) -> str:
-        """
-        FIX 10 – handles both plain-string and enum conditional_type safely.
-        """
         ct = question.conditional_type
-        # Support both plain str and enum (.value)
         ct_str = ct.value if hasattr(ct, "value") else str(ct)
         if ct_str not in ("yes", "no"):
             return ""
         return clean_indents(
             """
             As you are given a conditional question, forecast ONLY the **CHILD** question
-            given the parent's resolution. Never re-forecast the parent. Use probabilistic
-            reasoning, strongly considering the parent's resolution, to forecast the child.
+            given the parent's resolution. Never re-forecast the parent.
             """
         )
 
     # -------------------------------------------------------------------------
-    # IMPROVEMENT G – per-question timing wrapper
+    # Per-question timing wrapper
     # -------------------------------------------------------------------------
     async def _make_prediction(
         self, question: MetaculusQuestion, research: str
@@ -1701,20 +1657,18 @@ class NikeBot(ForecastBot):
 
 
 # ---------------------------------------------------------------------------
-# IMPROVEMENT E – structured startup banner
+# Startup banner (logs only — never touches Metaculus reasoning)
 # ---------------------------------------------------------------------------
 def _log_startup_banner(mode: str, dry_run: bool) -> None:
     logger.info("=" * 60)
     logger.info("  Nike Bot  —  Just Forecast It.")
-    logger.info("  Mode       : %s%s", mode, "  [DRY RUN]" if dry_run else "")
-    logger.info("  Default    : %s", OPENROUTER_DEFAULT_MODEL)
-    logger.info("  Parser     : %s", OPENROUTER_PARSER_MODEL)
-    logger.info("  LinkUp     : %s", "configured" if LINKUP_API_KEY else "not configured")
-    logger.info("  Exa        : %s", "configured" if EXA_API_KEY else "not configured")
-    logger.info("  MaxDepth   : %d", MAX_COERCE_DEPTH)
-    logger.info("  CalibScale : %.2f", CALIBRATION_SCALE)
-    logger.info("  EarlyStop  : %.2f log-odds stdev", EARLY_STOP_TOLERANCE)
-    logger.info("  RunLog     : %s", RUN_LOG_PATH if RUN_LOG_PATH else "disabled")
+    logger.info("  Mode          : %s%s", mode, "  [DRY RUN]" if dry_run else "")
+    logger.info("  CalibScale    : %.2f (1.0 = no regression)", CALIBRATION_SCALE)
+    logger.info("  ExtremizeScale: %.2f (>1.0 = push from 0.5)", EXTREMIZE_SCALE)
+    logger.info("  EarlyStop     : %.2f log-odds stdev", EARLY_STOP_TOLERANCE)
+    logger.info("  RunLog        : %s", RUN_LOG_PATH if RUN_LOG_PATH else "disabled")
+    logger.info("  LinkUp        : %s", "configured" if LINKUP_API_KEY else "not configured")
+    logger.info("  Exa           : %s", "configured" if EXA_API_KEY else "not configured")
     logger.info("=" * 60)
 
 
@@ -1735,7 +1689,6 @@ if __name__ == "__main__":
         choices=["tournament", "metaculus_cup", "test_questions"],
         default="tournament",
     )
-    # IMPROVEMENT F – dry-run: research runs but nothing is published
     arg_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1790,7 +1743,6 @@ if __name__ == "__main__":
 
     client = PatchedMetaculusClient()
 
-    # FIX 8 – validate slug before running any forecasts
     async def _run_tournament_mode() -> List[Any]:
         slug_ok = await client.validate_tournament_slug(MARKET_PULSE_TOURNAMENT_SLUG)
         if not slug_ok:
@@ -1814,7 +1766,6 @@ if __name__ == "__main__":
         )
         return list(seasonal) + list(minibench) + list(market_pulse)
 
-    # FIX 7 – test_questions fetches are properly async-gathered
     async def _run_test_mode() -> List[Any]:
         EXAMPLE_QUESTIONS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
