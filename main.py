@@ -64,7 +64,7 @@ HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
-MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
+MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q2"
 SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
@@ -94,6 +94,12 @@ MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_
 
 # Spring contest – only forecast if high probability of scoring well
 SPRING_CONTEST_MIN_CONFIDENCE: float = float(os.getenv("SPRING_CONTEST_MIN_CONFIDENCE", "0.70"))
+
+# Spring contest extremization – more conservative to avoid overconfidence
+SPRING_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("SPRING_EXTREMIZE_HIGH_CEILING", "0.60"))
+SPRING_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("SPRING_EXTREMIZE_HIGH_ROOF", "0.95"))
+SPRING_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("SPRING_EXTREMIZE_LOW_THRESHOLD", "0.40"))
+SPRING_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("SPRING_EXTREMIZE_LOW_FLOOR", "0.05"))
 
 RUN_LOG_PATH: str = os.getenv("RUN_LOG_PATH", "nike_bot_run_log.jsonl")
 
@@ -1755,32 +1761,61 @@ def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
     return extremized
 
 
+def _extremize_spring_forecasts(forecasts: List[Any]) -> List[Any]:
+    """
+    Apply conservative extremization to spring forecasts to avoid overconfidence.
+    - High forecasts (>= SPRING_EXTREMIZE_HIGH_CEILING) are pushed toward SPRING_EXTREMIZE_HIGH_ROOF
+    - Low forecasts (<= SPRING_EXTREMIZE_LOW_THRESHOLD) are pushed toward SPRING_EXTREMIZE_LOW_FLOOR
+    Only extremizes if _evidence_suggests_extremization returns True.
+    Uses more conservative thresholds than minibench.
+    """
+    extremized = []
+    for forecast in forecasts:
+        if isinstance(forecast, Exception):
+            extremized.append(forecast)
+            continue
+        try:
+            # If it's a dict with prediction/decimal info, check for extremization
+            if isinstance(forecast, dict):
+                forecast_copy = forecast.copy()
+                if "decimal_pred" in forecast_copy:
+                    pred = forecast_copy["decimal_pred"]
+                    evidence_strong = _evidence_suggests_extremization(forecast)
+                    
+                    if evidence_strong:
+                        if pred >= SPRING_EXTREMIZE_HIGH_CEILING:
+                            forecast_copy["decimal_pred"] = SPRING_EXTREMIZE_HIGH_ROOF
+                            logger.info("Spring: Extremized high forecast %.2f → %.2f (conservative)", pred, SPRING_EXTREMIZE_HIGH_ROOF)
+                        elif pred <= SPRING_EXTREMIZE_LOW_THRESHOLD:
+                            forecast_copy["decimal_pred"] = SPRING_EXTREMIZE_LOW_FLOOR
+                            logger.info("Spring: Extremized low forecast %.2f → %.2f (conservative)", pred, SPRING_EXTREMIZE_LOW_FLOOR)
+                        else:
+                            logger.info("Spring: Forecast %.2f not extremized (below thresholds despite evidence)", pred)
+                    else:
+                        logger.info("Spring: Forecast %.2f not extremized (weak evidence)", pred)
+                extremized.append(forecast_copy)
+            else:
+                extremized.append(forecast)
+        except Exception as e:
+            logger.warning("Error extremizing spring forecast: %s", e)
+            extremized.append(forecast)
+    return extremized
+
+
 async def _conditionally_forecast_spring(client, bot) -> List[Any]:
     """
-    Only forecast on Spring contest if confidence level is above threshold.
-    Returns an empty list if confidence is below threshold.
+    Always forecast on Spring contest with conservative extremization to avoid overconfidence.
     """
-    # Calculate average confidence from recent predictions
-    avg_confidence = getattr(bot, "_avg_recent_confidence", 0.5)
-    
-    if avg_confidence >= SPRING_CONTEST_MIN_CONFIDENCE:
-        logger.info(
-            "Spring contest: Avg confidence %.2f >= threshold %.2f. Forecasting...",
-            avg_confidence, SPRING_CONTEST_MIN_CONFIDENCE
+    logger.info("Spring contest: Forecasting with conservative extremization...")
+    try:
+        spring_results = await bot.forecast_on_tournament(
+            SPRING_2026_AI_BENCHMARKING_SLUG, return_exceptions=True
         )
-        try:
-            spring_results = await bot.forecast_on_tournament(
-                SPRING_2026_AI_BENCHMARKING_SLUG, return_exceptions=True
-            )
-            return list(spring_results)
-        except Exception as e:
-            logger.warning("Error forecasting on spring contest: %s", e)
-            return []
-    else:
-        logger.info(
-            "Spring contest: Avg confidence %.2f < threshold %.2f. Skipping.",
-            avg_confidence, SPRING_CONTEST_MIN_CONFIDENCE
-        )
+        # Apply conservative extremization to spring forecasts
+        extremized_spring = _extremize_spring_forecasts(spring_results)
+        return list(extremized_spring)
+    except Exception as e:
+        logger.warning("Error forecasting on spring contest: %s", e)
         return []
 
 
