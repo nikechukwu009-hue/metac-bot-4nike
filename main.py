@@ -64,14 +64,15 @@ HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
-MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
+MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q2"
+SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 _FALLBACK_PERCENTILES = (10, 20, 40, 60, 80, 90)
 
 # CHANGED: No shrinkage toward 0.5. We want decisive forecasts.
 # Set < 1.0 only if you observe severe overconfidence in Brier score post-hoc.
-CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.0"))
+CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.45"))
 
 # NEW: Extremization factor applied AFTER log-odds aggregation across runs.
 # Pushes the consensus prediction further from 0.5, rewarding confident calls.
@@ -80,6 +81,19 @@ CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.0"))
 EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "1.25"))
 
 EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
+
+# Extremizing low forecasts – if prediction is <= 35%, push to 2%
+LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"))
+LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.02"))
+
+# Minibench extremization – extremize both high and low forecasts
+MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.65"))
+MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.98"))
+MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.35"))
+MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.02"))
+
+# Spring contest – only forecast if high probability of scoring well
+SPRING_CONTEST_MIN_CONFIDENCE: float = float(os.getenv("SPRING_CONTEST_MIN_CONFIDENCE", "0.70"))
 
 RUN_LOG_PATH: str = os.getenv("RUN_LOG_PATH", "nike_bot_run_log.jsonl")
 
@@ -1673,6 +1687,71 @@ def _log_startup_banner(mode: str, dry_run: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Minibench and Spring Contest Extremization Helpers
+# ---------------------------------------------------------------------------
+
+def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
+    """
+    Apply bidirectional extremization to minibench forecasts.
+    - High forecasts (>= MINIBENCH_EXTREMIZE_HIGH_CEILING) are pushed toward MINIBENCH_EXTREMIZE_HIGH_ROOF
+    - Low forecasts (<= MINIBENCH_EXTREMIZE_LOW_THRESHOLD) are pushed toward MINIBENCH_EXTREMIZE_LOW_FLOOR
+    """
+    extremized = []
+    for forecast in forecasts:
+        if isinstance(forecast, Exception):
+            extremized.append(forecast)
+            continue
+        try:
+            # If it's a dict with prediction/decimal info, extremize it
+            if isinstance(forecast, dict):
+                forecast_copy = forecast.copy()
+                if "decimal_pred" in forecast_copy:
+                    pred = forecast_copy["decimal_pred"]
+                    if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
+                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
+                        logger.info("Minibench: Extremized high forecast %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_HIGH_ROOF)
+                    elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
+                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
+                        logger.info("Minibench: Extremized low forecast %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_LOW_FLOOR)
+                extremized.append(forecast_copy)
+            else:
+                extremized.append(forecast)
+        except Exception as e:
+            logger.warning("Error extremizing minibench forecast: %s", e)
+            extremized.append(forecast)
+    return extremized
+
+
+async def _conditionally_forecast_spring(client, bot) -> List[Any]:
+    """
+    Only forecast on Spring contest if confidence level is above threshold.
+    Returns an empty list if confidence is below threshold.
+    """
+    # Calculate average confidence from recent predictions
+    avg_confidence = getattr(bot, "_avg_recent_confidence", 0.5)
+    
+    if avg_confidence >= SPRING_CONTEST_MIN_CONFIDENCE:
+        logger.info(
+            "Spring contest: Avg confidence %.2f >= threshold %.2f. Forecasting...",
+            avg_confidence, SPRING_CONTEST_MIN_CONFIDENCE
+        )
+        try:
+            spring_results = await bot.forecast_on_tournament(
+                SPRING_2026_AI_BENCHMARKING_SLUG, return_exceptions=True
+            )
+            return list(spring_results)
+        except Exception as e:
+            logger.warning("Error forecasting on spring contest: %s", e)
+            return []
+    else:
+        logger.info(
+            "Spring contest: Avg confidence %.2f < threshold %.2f. Skipping.",
+            avg_confidence, SPRING_CONTEST_MIN_CONFIDENCE
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -1754,9 +1833,11 @@ if __name__ == "__main__":
         seasonal = await nike_bot.forecast_on_tournament(
             client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
         )
-        minibench = await nike_bot.forecast_on_tournament(
+        minibench_raw = await nike_bot.forecast_on_tournament(
             client.CURRENT_MINIBENCH_ID, return_exceptions=True
         )
+        # Apply extremization to minibench forecasts for both high and low ends
+        minibench = _extremize_minibench_forecasts(minibench_raw)
         market_pulse: List[Any] = (
             await nike_bot.forecast_on_tournament(
                 MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True
@@ -1764,7 +1845,9 @@ if __name__ == "__main__":
             if slug_ok
             else []
         )
-        return list(seasonal) + list(minibench) + list(market_pulse)
+        # Conditionally forecast on Spring contest only if high confidence
+        spring_results = await _conditionally_forecast_spring(client, nike_bot)
+        return list(seasonal) + list(minibench) + list(market_pulse) + spring_results
 
     async def _run_test_mode() -> List[Any]:
         EXAMPLE_QUESTIONS = [
