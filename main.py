@@ -64,7 +64,7 @@ HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
-MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q2"
+MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q1"
 SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
