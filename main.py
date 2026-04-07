@@ -87,7 +87,7 @@ LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"
 LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.02"))
 
 # Minibench extremization – extremize both high and low forecasts
-MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.65"))
+MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.52"))
 MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.98"))
 MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.35"))
 MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.02"))
@@ -1690,11 +1690,37 @@ def _log_startup_banner(mode: str, dry_run: bool) -> None:
 # Minibench and Spring Contest Extremization Helpers
 # ---------------------------------------------------------------------------
 
+def _evidence_suggests_extremization(forecast: dict) -> bool:
+    """
+    Check if the forecast's explanation suggests strong evidence for extremization.
+    Returns True if evidence indicates the prediction should be extremized.
+    """
+    if not isinstance(forecast, dict) or 'explanation' not in forecast:
+        return False
+    
+    explanation = forecast.get('explanation', '').lower()
+    
+    # Check for strong evidence keywords
+    strong_evidence_keywords = [
+        'strong evidence', 'highly confident', 'clear indication', 'overwhelming',
+        'compelling evidence', 'definitive', 'certain', 'conclusive',
+        'robust evidence', 'solid foundation', 'high confidence'
+    ]
+    
+    has_keywords = any(keyword in explanation for keyword in strong_evidence_keywords)
+    
+    # Check explanation length as proxy for detailed reasoning
+    is_detailed = len(explanation) > 500
+    
+    return has_keywords or is_detailed
+
+
 def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
     """
-    Apply bidirectional extremization to minibench forecasts.
+    Apply bidirectional extremization to minibench forecasts, but only if evidence suggests it.
     - High forecasts (>= MINIBENCH_EXTREMIZE_HIGH_CEILING) are pushed toward MINIBENCH_EXTREMIZE_HIGH_ROOF
     - Low forecasts (<= MINIBENCH_EXTREMIZE_LOW_THRESHOLD) are pushed toward MINIBENCH_EXTREMIZE_LOW_FLOOR
+    Only extremizes if _evidence_suggests_extremization returns True.
     """
     extremized = []
     for forecast in forecasts:
@@ -1702,17 +1728,24 @@ def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
             extremized.append(forecast)
             continue
         try:
-            # If it's a dict with prediction/decimal info, extremize it
+            # If it's a dict with prediction/decimal info, check for extremization
             if isinstance(forecast, dict):
                 forecast_copy = forecast.copy()
                 if "decimal_pred" in forecast_copy:
                     pred = forecast_copy["decimal_pred"]
-                    if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
-                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
-                        logger.info("Minibench: Extremized high forecast %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_HIGH_ROOF)
-                    elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
-                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
-                        logger.info("Minibench: Extremized low forecast %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_LOW_FLOOR)
+                    evidence_strong = _evidence_suggests_extremization(forecast)
+                    
+                    if evidence_strong:
+                        if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
+                            forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
+                            logger.info("Minibench: Extremized high forecast %.2f → %.2f (strong evidence)", pred, MINIBENCH_EXTREMIZE_HIGH_ROOF)
+                        elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
+                            forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
+                            logger.info("Minibench: Extremized low forecast %.2f → %.2f (strong evidence)", pred, MINIBENCH_EXTREMIZE_LOW_FLOOR)
+                        else:
+                            logger.info("Minibench: Forecast %.2f not extremized (below thresholds despite evidence)", pred)
+                    else:
+                        logger.info("Minibench: Forecast %.2f not extremized (weak evidence)", pred)
                 extremized.append(forecast_copy)
             else:
                 extremized.append(forecast)
