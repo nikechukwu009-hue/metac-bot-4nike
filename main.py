@@ -52,6 +52,9 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 OPENROUTER_DEFAULT_MODEL = os.getenv(
     "OPENROUTER_DEFAULT_MODEL", "openrouter/anthropic/claude-sonnet-4.6"
 )
+OPENROUTER_SUMMARIZER_MODEL = os.getenv(
+    "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
+)
 OPENROUTER_PARSER_MODEL = os.getenv(
     "OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL
 )
@@ -71,11 +74,11 @@ SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 _FALLBACK_PERCENTILES = (10, 20, 40, 60, 80, 90)
 
-# Conservative default calibration to keep forecasts closer to 50%
-CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "0.90"))
+# No default routing toward 50%; forecasts should follow evidence.
+CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.00"))
 
-# Conservative extremization: do not push forecasts away from 0.5 by default.
-EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "0.95"))
+# Mild aggregation extremization after evidence-based forecasts.
+EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "1.15"))
 
 EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
 
@@ -83,10 +86,10 @@ EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
 LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"))
 LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.08"))
 
-# Minibench extremization – extremize both high and low forecasts
+# Minibench extremization – push moderately confident minibench forecasts to extremes.
 MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.52"))
 MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.98"))
-MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.35"))
+MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.48"))
 MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.02"))
 
 # Spring contest – only forecast if high probability of scoring well
@@ -695,11 +698,11 @@ async def _compress_reasoning(
 # ---------------------------------------------------------------------------
 class NikeBot(ForecastBot):
     """
-    Nike Bot — Conservative forecast mode.
+    Nike Bot — Evidence-first forecast mode.
 
-    Designed for calibrated, evidence-weighted probability estimates:
-    - Conservative shrinkage toward 50% unless evidence is strong.
-    - Minimal extremization by default.
+    Designed for evidence-based probability estimates:
+    - No default bias toward 50%; forecasts should follow the research.
+    - Mild aggregation extremization after model judgment.
     - Research runs can use OpenRouter Perplexity Sonar Pro in parallel.
     - Compressed Metaculus comments in first person.
     - Per-question timing, JSONL run log, community prediction fallback.
@@ -966,12 +969,12 @@ class NikeBot(ForecastBot):
             (e) Your overall read: which way does the evidence lean, and how strongly?
 
             IMPORTANT INSTRUCTIONS:
-            - If the research clearly supports one outcome, reflect that clearly in your
-              probability. If evidence is weak, keep the forecast close to 50%.
+            - Forecast based on the research and evidence. Do not bias the forecast
+              toward 50% unless the evidence is genuinely balanced.
             - If you assess >75% likelihood, say so. If <25%, say so.
-            - Good forecasters put extra weight on the status quo and update cautiously
-              on weak or ambiguous evidence.
-            - Avoid overconfidence. Do not move far from 50% unless the evidence is strong.
+            - Good forecasters put extra weight on the status quo, but follow strong
+              evidence when it exists.
+            - Avoid artificial centering; 50% should only appear in genuinely ambiguous cases.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -1766,10 +1769,9 @@ def _evidence_suggests_extremization(forecast: dict) -> bool:
 
 def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
     """
-    Apply bidirectional extremization to minibench forecasts, but only if evidence suggests it.
-    - High forecasts (>= MINIBENCH_EXTREMIZE_HIGH_CEILING) are pushed toward MINIBENCH_EXTREMIZE_HIGH_ROOF
-    - Low forecasts (<= MINIBENCH_EXTREMIZE_LOW_THRESHOLD) are pushed toward MINIBENCH_EXTREMIZE_LOW_FLOOR
-    Only extremizes if _evidence_suggests_extremization returns True.
+    Apply aggressive extremization to minibench forecasts.
+    - High forecasts (>= MINIBENCH_EXTREMIZE_HIGH_CEILING) are pushed toward MINIBENCH_EXTREMIZE_HIGH_ROOF.
+    - Low forecasts (<= MINIBENCH_EXTREMIZE_LOW_THRESHOLD) are pushed toward MINIBENCH_EXTREMIZE_LOW_FLOOR.
     """
     extremized = []
     for forecast in forecasts:
@@ -1777,24 +1779,24 @@ def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
             extremized.append(forecast)
             continue
         try:
-            # If it's a dict with prediction/decimal info, check for extremization
             if isinstance(forecast, dict):
                 forecast_copy = forecast.copy()
                 if "decimal_pred" in forecast_copy:
                     pred = forecast_copy["decimal_pred"]
-                    evidence_strong = _evidence_suggests_extremization(forecast)
-                    
-                    if evidence_strong:
-                        if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
-                            forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
-                            logger.info("Minibench: Extremized high forecast %.2f → %.2f (strong evidence)", pred, MINIBENCH_EXTREMIZE_HIGH_ROOF)
-                        elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
-                            forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
-                            logger.info("Minibench: Extremized low forecast %.2f → %.2f (strong evidence)", pred, MINIBENCH_EXTREMIZE_LOW_FLOOR)
-                        else:
-                            logger.info("Minibench: Forecast %.2f not extremized (below thresholds despite evidence)", pred)
-                    else:
-                        logger.info("Minibench: Forecast %.2f not extremized (weak evidence)", pred)
+                    if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
+                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
+                        logger.info(
+                            "Minibench: Extremized high forecast %.2f → %.2f",
+                            pred,
+                            MINIBENCH_EXTREMIZE_HIGH_ROOF,
+                        )
+                    elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
+                        forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
+                        logger.info(
+                            "Minibench: Extremized low forecast %.2f → %.2f",
+                            pred,
+                            MINIBENCH_EXTREMIZE_LOW_FLOOR,
+                        )
                 extremized.append(forecast_copy)
             else:
                 extremized.append(forecast)
@@ -1907,7 +1909,7 @@ if __name__ == "__main__":
                 allowed_tries=2,
             ),
             "summarizer": GeneralLlm(
-                model=OPENROUTER_DEFAULT_MODEL,
+                model=OPENROUTER_SUMMARIZER_MODEL,
                 temperature=0.2,
                 timeout=60,
                 allowed_tries=2,
