@@ -50,7 +50,7 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/openai/gpt-5.4"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/anthropic/claude-sonnet-4.6"
 )
 OPENROUTER_PARSER_MODEL = os.getenv(
     "OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL
@@ -64,27 +64,24 @@ HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
+AI_TOURNAMENT_ID = "33022"
 MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q2"
 SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 _FALLBACK_PERCENTILES = (10, 20, 40, 60, 80, 90)
 
-# CHANGED: No shrinkage toward 0.5. We want decisive forecasts.
-# Set < 1.0 only if you observe severe overconfidence in Brier score post-hoc.
-CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.45"))
+# Conservative default calibration to keep forecasts closer to 50%
+CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "0.90"))
 
-# NEW: Extremization factor applied AFTER log-odds aggregation across runs.
-# Pushes the consensus prediction further from 0.5, rewarding confident calls.
-# 1.25 means a 70% forecast becomes ~76%, a 90% forecast becomes ~96%.
-# Tune down toward 1.0 if Brier scores worsen empirically.
-EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "1.25"))
+# Conservative extremization: do not push forecasts away from 0.5 by default.
+EXTREMIZE_SCALE: float = float(os.getenv("EXTREMIZE_SCALE", "0.95"))
 
 EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
 
-# Extremizing low forecasts – if prediction is <= 35%, push to 2%
+# Extremizing low forecasts – if prediction is <= 35%, push to 8%
 LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"))
-LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.02"))
+LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.08"))
 
 # Minibench extremization – extremize both high and low forecasts
 MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.52"))
@@ -668,16 +665,18 @@ async def _compress_reasoning(
         Full reasoning:
         {full_reasoning[:3000]}
 
-        Write exactly 2-3 sentences that:
-        1. State the single most decisive piece of evidence from the research.
-        2. Briefly name the main counter-risk.
-        3. State the conclusion and confidence in plain language.
+        Write exactly 2-3 sentences in first person that:
+        1. State the strongest evidence that supports the forecast.
+        2. Briefly name the main remaining risk.
+        3. State the conclusion and confidence clearly.
 
         Rules:
+        - Use first person (I / I'm) and be direct.
+        - Do not describe the research process, tools, or strategy.
         - No model names, no tool names, no "my research assistant says".
         - No hedging phrases like "it's hard to say" or "I could be wrong".
         - No bullet points, headers, or markdown.
-        - Start directly with the evidence, not with "The question asks..." or "Based on...".
+        - Start with evidence or the conclusion, not with "The question asks...".
         """
     )
     try:
@@ -696,13 +695,13 @@ async def _compress_reasoning(
 # ---------------------------------------------------------------------------
 class NikeBot(ForecastBot):
     """
-    Nike Bot — Just Forecast It.
+    Nike Bot — Conservative forecast mode.
 
-    Optimised for high Brier scores on Minibench and AI tournament:
-    - Extremization after log-odds aggregation (EXTREMIZE_SCALE > 1.0).
-    - No regression toward 0.5 (CALIBRATION_SCALE = 1.0).
-    - Bold update instruction in binary prompt: follow the evidence hard.
-    - Compressed, model-agnostic reasoning published to Metaculus.
+    Designed for calibrated, evidence-weighted probability estimates:
+    - Conservative shrinkage toward 50% unless evidence is strong.
+    - Minimal extremization by default.
+    - Research runs can use OpenRouter Perplexity Sonar Pro in parallel.
+    - Compressed Metaculus comments in first person.
     - Per-question timing, JSONL run log, community prediction fallback.
     """
 
@@ -823,6 +822,9 @@ class NikeBot(ForecastBot):
             if researcher == "linkup+exa":
                 return await self._linkup_exa_research(question)
 
+            if researcher == "openrouter/perplexity/sonar-pro":
+                return await self._openrouter_sonar_research(question)
+
             if researcher in ("", "None", "no_research"):
                 return ""
 
@@ -886,6 +888,48 @@ class NikeBot(ForecastBot):
             """
         ).strip()
 
+    async def _openrouter_sonar_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        researcher = GeneralLlm(
+            model="openrouter/perplexity/sonar-pro",
+            temperature=0.15,
+            timeout=80,
+            allowed_tries=2,
+        )
+
+        base_prompt = clean_indents(
+            f"""
+            You are a research assistant for a conservative forecaster.
+            Produce a concise briefing for this question.
+
+            Question:
+            {q}
+
+            Resolution criteria:
+            {criteria}
+
+            Output requirements:
+            - Summarize the strongest evidence for each outcome.
+            - Identify the main risk or countervailing factor.
+            - Note the most important near-term event or signal that would shift the answer.
+            - Keep the response factual and direct.
+            """
+        )
+
+        prompts = [
+            base_prompt + "\nFocus first on the most recent authoritative signals and current status quo.",
+            base_prompt + "\nFocus on what would make the question resolve YES or NO and why those scenarios are plausible.",
+            base_prompt + "\nFocus on risks, uncertainties, and the most important unresolved evidence that could change the forecast.",
+        ]
+
+        results = await asyncio.gather(*(researcher.invoke(p) for p in prompts))
+        combined = "\n\n---\n\n".join(
+            f"Research pass {i+1}:\n{result.strip()}"
+            for i, result in enumerate(results, start=1)
+        )
+        return combined
+
     # -------------------------------------------------------------------------
     # Binary questions
     # -------------------------------------------------------------------------
@@ -923,12 +967,11 @@ class NikeBot(ForecastBot):
 
             IMPORTANT INSTRUCTIONS:
             - If the research clearly supports one outcome, reflect that clearly in your
-              probability. Do not hedge excessively — a 55% when evidence strongly points
-              one way is a poor forecast.
+              probability. If evidence is weak, keep the forecast close to 50%.
             - If you assess >75% likelihood, say so. If <25%, say so.
-            - Good forecasters put extra weight on the status quo, but update hard when
-              evidence demands it.
-            - Avoid anchoring on 50% without a strong reason.
+            - Good forecasters put extra weight on the status quo and update cautiously
+              on weak or ambiguous evidence.
+            - Avoid overconfidence. Do not move far from 50% unless the evidence is strong.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -1873,12 +1916,7 @@ if __name__ == "__main__":
             # "researcher": "asknews/news-summaries",
             # "researcher": "smart-searcher/openai/gpt-4o-mini",
             # "researcher": "linkup+exa",
-            "researcher": GeneralLlm(
-                model=OPENROUTER_DEFAULT_MODEL,
-                temperature=0.2,
-                timeout=60,
-                allowed_tries=2,
-            ),
+            "researcher": "openrouter/perplexity/sonar-pro",
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
                 temperature=0.0,
@@ -1899,7 +1937,7 @@ if __name__ == "__main__":
             )
 
         seasonal = await nike_bot.forecast_on_tournament(
-            client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+            AI_TOURNAMENT_ID, return_exceptions=True
         )
         minibench_raw = await nike_bot.forecast_on_tournament(
             client.CURRENT_MINIBENCH_ID, return_exceptions=True
