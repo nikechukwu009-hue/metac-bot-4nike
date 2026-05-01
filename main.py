@@ -1918,7 +1918,7 @@ if __name__ == "__main__":
             # "researcher": "asknews/news-summaries",
             # "researcher": "smart-searcher/openai/gpt-4o-mini",
             # "researcher": "linkup+exa",
-            "researcher": ["linkup+exa", "smart-searcher/openrouter/gpt-4o", "smart-searcher/openrouter/perplexity/sonar-pro"],
+            "researcher": ["linkup+exa", "smart-searcher/openrouter/perplexity/sonar-pro"],
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
                 temperature=0.0,
