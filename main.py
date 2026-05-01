@@ -1941,11 +1941,24 @@ if __name__ == "__main__":
         seasonal = await nike_bot.forecast_on_tournament(
             AI_TOURNAMENT_ID, return_exceptions=True
         )
-        minibench_raw = await nike_bot.forecast_on_tournament(
-            client.CURRENT_MINIBENCH_ID, return_exceptions=True
-        )
-        # Apply extremization to minibench forecasts for both high and low ends
-        minibench = _extremize_minibench_forecasts(minibench_raw)
+        
+        # Validate and forecast on minibench if available with extremization
+        minibench_ok = await client.validate_tournament_slug(
+            client.CURRENT_MINIBENCH_ID
+        ) if hasattr(client.CURRENT_MINIBENCH_ID, 'lower') else True
+        if not minibench_ok:
+            logger.error(
+                "Minibench tournament '%s' is not available — skipping minibench.",
+                client.CURRENT_MINIBENCH_ID,
+            )
+            minibench = []
+        else:
+            minibench_raw = await nike_bot.forecast_on_tournament(
+                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            )
+            # Apply extremization to minibench forecasts for both high and low ends
+            minibench = _extremize_minibench_forecasts(minibench_raw)
+        
         market_pulse: List[Any] = (
             await nike_bot.forecast_on_tournament(
                 MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True
