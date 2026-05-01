@@ -50,7 +50,7 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/perplexity/sonar"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/anthropic/claude-3-opus"
 )
 OPENROUTER_SUMMARIZER_MODEL = os.getenv(
     "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
