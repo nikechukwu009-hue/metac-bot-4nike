@@ -50,7 +50,7 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/anthropic/claude-sonnet-4.6"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/perplexity/sonar"
 )
 OPENROUTER_SUMMARIZER_MODEL = os.getenv(
     "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
@@ -87,10 +87,10 @@ LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"
 LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.08"))
 
 # Minibench extremization – push moderately confident minibench forecasts to extremes.
-MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.52"))
-MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.98"))
-MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.48"))
-MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.02"))
+MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.51"))
+MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.99"))
+MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.49"))
+MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.01"))
 
 # Spring contest – only forecast if high probability of scoring well
 SPRING_CONTEST_MIN_CONFIDENCE: float = float(os.getenv("SPRING_CONTEST_MIN_CONFIDENCE", "0.70"))
@@ -1918,7 +1918,7 @@ if __name__ == "__main__":
             # "researcher": "asknews/news-summaries",
             # "researcher": "smart-searcher/openai/gpt-4o-mini",
             # "researcher": "linkup+exa",
-            "researcher": "openrouter/perplexity/sonar-pro",
+            "researcher": ["linkup+exa", "smart-searcher/openrouter/gpt-4o", "smart-searcher/openrouter/perplexity/sonar-pro"],
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
                 temperature=0.0,
