@@ -822,6 +822,12 @@ class NikeBot(ForecastBot):
                 )
                 return await searcher.invoke(prompt)
 
+            if researcher == "linkup":
+                return await self._linkup_research(question)
+
+            if researcher == "exa":
+                return await self._exa_research(question)
+
             if researcher == "linkup+exa":
                 return await self._linkup_exa_research(question)
 
@@ -835,6 +841,105 @@ class NikeBot(ForecastBot):
             "Unrecognised researcher value %r — returning empty research.", researcher
         )
         return ""
+
+    async def _linkup_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
+
+        linkup_1, linkup_2 = await asyncio.gather(
+            linkup_search(q, max_results=8, depth="deep"),
+            linkup_search(query_resolution, max_results=6, depth="deep"),
+        )
+        combined: List[Dict[str, Any]] = [
+            *(linkup_1 or []),
+            *(linkup_2 or []),
+        ]
+        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
+
+        summarize_prompt = clean_indents(
+            f"""
+            You are a research assistant to a superforecaster.
+            Task: produce a concise, decision-relevant briefing grounded in the retrieved
+            sources. Do NOT produce a final forecast. Do NOT invent facts.
+
+            Question:
+            {q}
+
+            Resolution criteria:
+            {criteria}
+
+            Retrieved web snippets (ranked; each includes a URL):
+            {sources_block}
+
+            Output format:
+            1) Key facts (4-5 bullets max)
+            2) What would make this resolve YES vs NO (brief)
+            3) Timeline / what's likely before resolution (brief)
+            4) Source list (just the URLs, one per line)
+            """
+        )
+        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
+        url_list = "\n".join(urls[:20]) if urls else ""
+        return clean_indents(
+            f"""
+            {summary}
+
+            --- LINKUP SOURCES (ranked URLs) ---
+            {url_list}
+            """
+        ).strip()
+
+    async def _exa_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
+        query_criteria_only = criteria[:700] if criteria else q
+
+        exa_1, exa_2, exa_3 = await asyncio.gather(
+            exa_search(q, max_results=10),
+            exa_search(query_resolution, max_results=8),
+            exa_search(query_criteria_only, max_results=6),
+        )
+        combined: List[Dict[str, Any]] = [
+            *(exa_1 or []),
+            *(exa_2 or []),
+            *(exa_3 or []),
+        ]
+        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
+
+        summarize_prompt = clean_indents(
+            f"""
+            You are a research assistant to a superforecaster.
+            Task: produce a concise, decision-relevant briefing grounded in the retrieved
+            sources. Do NOT produce a final forecast. Do NOT invent facts.
+
+            Question:
+            {q}
+
+            Resolution criteria:
+            {criteria}
+
+            Retrieved web snippets (ranked; each includes a URL):
+            {sources_block}
+
+            Output format:
+            1) Key facts (4-5 bullets max)
+            2) What would make this resolve YES vs NO (brief)
+            3) Timeline / what's likely before resolution (brief)
+            4) Source list (just the URLs, one per line)
+            """
+        )
+        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
+        url_list = "\n".join(urls[:20]) if urls else ""
+        return clean_indents(
+            f"""
+            {summary}
+
+            --- EXA SOURCES (ranked URLs) ---
+            {url_list}
+            """
+        ).strip()
 
     async def _linkup_exa_research(self, question: MetaculusQuestion) -> str:
         q = question.question_text.strip()
@@ -1918,7 +2023,13 @@ if __name__ == "__main__":
             # "researcher": "asknews/news-summaries",
             # "researcher": "smart-searcher/openai/gpt-4o-mini",
             # "researcher": "linkup+exa",
-            "researcher": ["linkup+exa", "smart-searcher/openrouter/perplexity/sonar-pro"],
+            "researcher": [
+                "linkup",
+                "exa",
+                "smart-searcher/openrouter/perplexity/sonar-pro",
+                "openrouter/perplexity/sonar-pro",
+                "asknews/deep-research/high-depth",
+            ],
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
                 temperature=0.0,
