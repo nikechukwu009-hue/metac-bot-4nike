@@ -50,7 +50,7 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/perplexity/sonar-pro"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/openai/gpt-oss-120b:free"
 )
 OPENROUTER_SUMMARIZER_MODEL = os.getenv(
     "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
