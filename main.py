@@ -2004,7 +2004,7 @@ if __name__ == "__main__":
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
+        extra_metadata_in_explanation=False,
         dry_run=dry_run,
         llms={
             "default": GeneralLlm(
@@ -2023,12 +2023,7 @@ if __name__ == "__main__":
             # "researcher": "asknews/news-summaries",
             # "researcher": "smart-searcher/openai/gpt-4o-mini",
             # "researcher": "linkup+exa",
-            "researcher": [
-                "linkup",
-                "exa",
-                "smart-searcher/openrouter/perplexity/sonar-pro",
-                "openrouter/perplexity/sonar-pro",
-                "asknews/deep-research/high-depth",
+            "researcher": ["openrouter/perplexity/sonar-pro",
             ],
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
