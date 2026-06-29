@@ -49,8 +49,11 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+# Free OpenRouter model — capable, no cost, always available.
+# Override via env to swap in any other free/paid model without code changes.
 OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/openai/gpt-oss-120b:free"
+    "OPENROUTER_DEFAULT_MODEL", "openrouter/free"
 )
 OPENROUTER_SUMMARIZER_MODEL = os.getenv(
     "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
@@ -59,8 +62,12 @@ OPENROUTER_PARSER_MODEL = os.getenv(
     "OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL
 )
 
+# ── Research API keys (all optional — missing keys = that source silently skipped)
 LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
 EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
+ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET", "")
+
 LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
 EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
@@ -86,16 +93,14 @@ EARLY_STOP_TOLERANCE: float = float(os.getenv("EARLY_STOP_TOLERANCE", "0.15"))
 LOW_FORECAST_THRESHOLD: float = float(os.getenv("LOW_FORECAST_THRESHOLD", "0.35"))
 LOW_FORECAST_FLOOR: float = float(os.getenv("LOW_FORECAST_FLOOR", "0.08"))
 
-# Minibench extremization – push moderately confident minibench forecasts to extremes.
+# Minibench extremization
 MINIBENCH_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_CEILING", "0.51"))
 MINIBENCH_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("MINIBENCH_EXTREMIZE_HIGH_ROOF", "0.99"))
 MINIBENCH_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_THRESHOLD", "0.49"))
 MINIBENCH_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("MINIBENCH_EXTREMIZE_LOW_FLOOR", "0.01"))
 
-# Spring contest – only forecast if high probability of scoring well
+# Spring contest extremization — more conservative to avoid overconfidence
 SPRING_CONTEST_MIN_CONFIDENCE: float = float(os.getenv("SPRING_CONTEST_MIN_CONFIDENCE", "0.70"))
-
-# Spring contest extremization – more conservative to avoid overconfidence
 SPRING_EXTREMIZE_HIGH_CEILING: float = float(os.getenv("SPRING_EXTREMIZE_HIGH_CEILING", "0.60"))
 SPRING_EXTREMIZE_HIGH_ROOF: float = float(os.getenv("SPRING_EXTREMIZE_HIGH_ROOF", "0.95"))
 SPRING_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("SPRING_EXTREMIZE_LOW_THRESHOLD", "0.40"))
@@ -401,6 +406,7 @@ async def _post_json_http(
 async def linkup_search(
     query: str, max_results: int = 8, depth: str = "deep"
 ) -> List[Dict[str, Any]]:
+    """Query Linkup. Returns [] silently if API key is missing or call fails."""
     if not LINKUP_API_KEY:
         return []
     headers = {
@@ -416,9 +422,13 @@ async def linkup_search(
         "includeInlineCitations": False,
         "maxResults": max_results,
     }
-    async with httpx.AsyncClient() as client:
-        data = await _post_json_http(client, LINKUP_ENDPOINT, headers, payload)
-    return data.get("results", []) or []
+    try:
+        async with httpx.AsyncClient() as client:
+            data = await _post_json_http(client, LINKUP_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+    except Exception as exc:
+        logger.warning("Linkup search failed (query=%r): %s", query[:60], exc)
+        return []
 
 
 async def exa_search(
@@ -426,6 +436,7 @@ async def exa_search(
     max_results: int = 8,
     max_age_hours: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """Query Exa. Returns [] silently if API key is missing or call fails."""
     if not EXA_API_KEY:
         return []
     headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
@@ -438,9 +449,36 @@ async def exa_search(
     }
     if max_age_hours is not None:
         payload["maxAgeHours"] = int(max_age_hours)
-    async with httpx.AsyncClient() as client:
-        data = await _post_json_http(client, EXA_ENDPOINT, headers, payload)
-    return data.get("results", []) or []
+    try:
+        async with httpx.AsyncClient() as client:
+            data = await _post_json_http(client, EXA_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+    except Exception as exc:
+        logger.warning("Exa search failed (query=%r): %s", query[:60], exc)
+        return []
+
+
+async def asknews_search(
+    query: str,
+    mode: str = "asknews/news-summaries",
+) -> str:
+    """
+    Query AskNews. Returns '' silently if credentials are missing or call fails.
+
+    mode can be one of:
+      - "asknews/news-summaries"
+      - "asknews/deep-research/low-depth"
+      - "asknews/deep-research/medium-depth"
+      - "asknews/deep-research/high-depth"
+    """
+    if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
+        return ""
+    try:
+        result = await AskNewsSearcher().call_preconfigured_version(mode, query)
+        return result or ""
+    except Exception as exc:
+        logger.warning("AskNews search failed (mode=%s): %s", mode, exc)
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +606,7 @@ def _aggregate_binary_predictions(probs: List[float]) -> float:
     if not probs:
         return 0.5
     mean_lo = statistics.mean(_to_log_odds(p) for p in probs)
-    # Calibration (default: no-op at 1.0)
     calibrated_lo = mean_lo * CALIBRATION_SCALE
-    raw = _from_log_odds(calibrated_lo)
-    # Extremization: stretch away from 0.5 in log-odds space
     extremized_lo = calibrated_lo * EXTREMIZE_SCALE
     extremized = _from_log_odds(extremized_lo)
     return max(0.01, min(0.99, extremized))
@@ -654,10 +689,6 @@ async def _compress_reasoning(
     question_text: str,
     final_prediction_str: str,
 ) -> str:
-    """
-    Distils the full chain-of-thought into ≤3 tight sentences suitable for a
-    Metaculus comment. No model names, no hedging boilerplate, no preamble.
-    """
     prompt = clean_indents(
         f"""
         You are editing a forecaster's reasoning note for a public comment.
@@ -684,13 +715,159 @@ async def _compress_reasoning(
     )
     try:
         compressed = await llm.invoke(prompt)
-        # Strip any accidental preamble lines
         lines = [l.strip() for l in compressed.strip().splitlines() if l.strip()]
-        return " ".join(lines[:5])  # cap at 5 sentences just in case
+        return " ".join(lines[:5])
     except Exception as exc:
         logger.warning("Reasoning compression failed: %s", exc)
-        # Fallback: first 300 chars of original
         return full_reasoning.strip()[:300]
+
+
+# ---------------------------------------------------------------------------
+# Multi-source research engine
+# ---------------------------------------------------------------------------
+
+async def _multi_source_research(
+    question: MetaculusQuestion,
+    summarizer_llm: GeneralLlm,
+) -> str:
+    """
+    Fan out to Exa, Linkup, and AskNews in parallel. Each source is optional —
+    missing API keys cause silent skips. All available results are merged,
+    ranked, and summarised. The final block clearly labels which sources
+    contributed so the downstream LLM knows how fresh the data is.
+
+    This is intentionally additive: callers can layer additional context on top.
+    """
+    q = question.question_text.strip()
+    criteria = (question.resolution_criteria or "").strip()
+    query_resolution = f"{q}\nResolution criteria:\n{criteria[:600]}"
+    query_criteria_only = criteria[:700] if criteria else q
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # ── Fan out all sources simultaneously ──────────────────────────────────
+    (
+        exa_1, exa_2, exa_3,
+        lk_1, lk_2,
+        asknews_result,
+    ) = await asyncio.gather(
+        exa_search(q, max_results=10),
+        exa_search(query_resolution, max_results=8),
+        exa_search(query_criteria_only, max_results=6),
+        linkup_search(q, max_results=8, depth="deep"),
+        linkup_search(query_resolution, max_results=6, depth="deep"),
+        asknews_search(q, mode="asknews/news-summaries"),
+        return_exceptions=True,
+    )
+
+    # Normalise exceptions to empty
+    def _safe_list(v: Any) -> List[Dict[str, Any]]:
+        return v if isinstance(v, list) else []
+
+    def _safe_str(v: Any) -> str:
+        return v if isinstance(v, str) else ""
+
+    structured_results: List[Dict[str, Any]] = [
+        *_safe_list(exa_1),
+        *_safe_list(exa_2),
+        *_safe_list(exa_3),
+        *_safe_list(lk_1),
+        *_safe_list(lk_2),
+    ]
+    asknews_text: str = _safe_str(asknews_result)
+
+    sources_active: List[str] = []
+    if any(_safe_list(r) for r in (exa_1, exa_2, exa_3)):
+        sources_active.append("Exa")
+    if any(_safe_list(r) for r in (lk_1, lk_2)):
+        sources_active.append("Linkup")
+    if asknews_text:
+        sources_active.append("AskNews")
+
+    sources_label = (
+        ", ".join(sources_active) if sources_active else "none (no API keys configured)"
+    )
+    logger.info(
+        "Multi-source research for %s — active sources: %s",
+        question.page_url, sources_label,
+    )
+
+    # ── Rank and format structured snippets ─────────────────────────────────
+    sources_block, urls = _rank_and_format_sources(structured_results, max_to_keep=14)
+    url_list = "\n".join(urls[:30]) if urls else "(none)"
+
+    # ── Build AskNews section ────────────────────────────────────────────────
+    asknews_section = ""
+    if asknews_text:
+        asknews_section = clean_indents(
+            f"""
+            === ASKNEWS NEWS SUMMARY (fetched {today}) ===
+            {asknews_text[:3000]}
+            """
+        )
+
+    # ── Synthesise with summariser LLM ──────────────────────────────────────
+    synthesise_prompt = clean_indents(
+        f"""
+        You are a research assistant to a professional superforecaster.
+        Today's date: {today}.
+
+        Your job: produce a concise, decision-relevant briefing that helps the
+        forecaster make a well-calibrated probability estimate. Do NOT produce
+        a final forecast yourself. Do NOT invent facts. Only state what the
+        retrieved evidence says.
+
+        Question:
+        {q}
+
+        Resolution criteria:
+        {criteria}
+
+        === STRUCTURED WEB SNIPPETS (ranked by source credibility) ===
+        {sources_block}
+
+        {asknews_section}
+
+        Output format (use these exact headers):
+        ## Key facts
+        (4-6 bullets of the most decision-relevant facts from the sources above)
+
+        ## YES scenario
+        (What evidence / conditions would lead to a YES resolution)
+
+        ## NO scenario
+        (What evidence / conditions would lead to a NO resolution)
+
+        ## Timeline signal
+        (Most important near-term event or data point that would shift the answer)
+
+        ## Recency note
+        (State the date range of the evidence you found and flag any gaps)
+
+        ## Sources
+        {url_list}
+        """
+    )
+
+    try:
+        summary = await summarizer_llm.invoke(synthesise_prompt)
+    except Exception as exc:
+        logger.warning("Synthesis LLM failed for %s: %s", question.page_url, exc)
+        summary = (
+            f"(Synthesis failed: {exc})\n\n"
+            f"Raw snippets:\n{sources_block}\n\n{asknews_section}"
+        )
+
+    return clean_indents(
+        f"""
+        {summary}
+
+        ---
+        RESEARCH SOURCES USED: {sources_label}
+        RETRIEVED: {today}
+        ---
+        """
+    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -700,12 +877,18 @@ class NikeBot(ForecastBot):
     """
     Nike Bot — Evidence-first forecast mode.
 
-    Designed for evidence-based probability estimates:
-    - No default bias toward 50%; forecasts should follow the research.
-    - Mild aggregation extremization after model judgment.
-    - Research runs can use OpenRouter Perplexity Sonar Pro in parallel.
-    - Compressed Metaculus comments in first person.
-    - Per-question timing, JSONL run log, community prediction fallback.
+    Research strategy (all sources additive and optional via API keys):
+      • Exa         — semantic web search, high recall
+      • Linkup      — deep web crawl with highlighted snippets
+      • AskNews     — curated news summaries with freshness scores
+    All three run in parallel; missing keys are silently skipped so the bot
+    always runs even with zero third-party keys (falls back to LLM priors only,
+    which is the worst case and clearly flagged in the research block).
+
+    Forecast model: free OpenRouter model (llama-4-maverick:free by default).
+    Every forecast prompt includes the full research block so the model's
+    knowledge cutoff cannot silently contaminate the answer — the research
+    always carries a retrieval date.
     """
 
     _max_concurrent_questions: int = 1
@@ -761,25 +944,29 @@ class NikeBot(ForecastBot):
     # -------------------------------------------------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of
-                the most relevant news, including whether the question would resolve Yes
-                or No based on current information. You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
+            # ── 1. Multi-source live research (Exa + Linkup + AskNews) ──────
+            live_research = await _multi_source_research(
+                question,
+                self.get_llm("summarizer", "llm"),
             )
-            research = await self._dispatch_research(question, prompt)
-            logger.info("Research for %s:\n%s", question.page_url, research)
+
+            # ── 2. Optional extra research via configured "researcher" key ──
+            extra_research = await self._dispatch_extra_research(question)
+
+            # ── 3. Merge ────────────────────────────────────────────────────
+            if extra_research.strip():
+                research = clean_indents(
+                    f"""
+                    {live_research}
+
+                    === ADDITIONAL RESEARCH ===
+                    {extra_research}
+                    """
+                ).strip()
+            else:
+                research = live_research
+
+            logger.info("Research for %s:\n%s", question.page_url, research[:1200])
             _run_logger.log({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "url": question.page_url,
@@ -788,58 +975,79 @@ class NikeBot(ForecastBot):
             })
             return research
 
-    async def _dispatch_research(
-        self, question: MetaculusQuestion, prompt: str
-    ) -> str:
+    async def _dispatch_extra_research(self, question: MetaculusQuestion) -> str:
+        """
+        Runs any researcher backend registered under the "researcher" LLM key.
+        Returns '' if no researcher key is configured or the call fails.
+        This is additive — it supplements, not replaces, the multi-source research.
+        """
         researcher = self.get_llm("researcher")
+        if researcher is None:
+            return ""
 
-        if isinstance(researcher, GeneralLlm):
-            return await researcher.invoke(prompt)
+        prompt = clean_indents(
+            f"""
+            You are an assistant to a superforecaster.
+            The superforecaster will give you a question they intend to forecast on.
+            To be a great assistant, you generate a concise but detailed rundown of
+            the most relevant news, including whether the question would resolve Yes
+            or No based on current information. You do not produce forecasts yourself.
 
-        if isinstance(researcher, str):
-            if researcher in (
-                "asknews/news-summaries",
-                "asknews/deep-research/low-depth",
-                "asknews/deep-research/medium-depth",
-                "asknews/deep-research/high-depth",
-            ):
-                return await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
+            Question:
+            {question.question_text}
 
-            if researcher.startswith("smart-searcher"):
-                model_name = (
-                    researcher[len("smart-searcher/"):]
-                    if researcher.startswith("smart-searcher/")
-                    else researcher
-                )
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                return await searcher.invoke(prompt)
+            Resolution criteria:
+            {question.resolution_criteria}
 
-            if researcher == "linkup":
-                return await self._linkup_research(question)
-
-            if researcher == "exa":
-                return await self._exa_research(question)
-
-            if researcher == "linkup+exa":
-                return await self._linkup_exa_research(question)
-
-            if researcher == "openrouter/perplexity/sonar-pro":
-                return await self._openrouter_sonar_research(question)
-
-            if researcher in ("", "None", "no_research"):
-                return ""
-
-        logger.warning(
-            "Unrecognised researcher value %r — returning empty research.", researcher
+            {question.fine_print}
+            """
         )
+
+        try:
+            if isinstance(researcher, GeneralLlm):
+                return await researcher.invoke(prompt)
+
+            if isinstance(researcher, str):
+                if researcher in (
+                    "asknews/news-summaries",
+                    "asknews/deep-research/low-depth",
+                    "asknews/deep-research/medium-depth",
+                    "asknews/deep-research/high-depth",
+                ):
+                    return await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+
+                if researcher.startswith("smart-searcher"):
+                    model_name = (
+                        researcher[len("smart-searcher/"):]
+                        if researcher.startswith("smart-searcher/")
+                        else researcher
+                    )
+                    searcher = SmartSearcher(
+                        model=model_name,
+                        temperature=0,
+                        num_searches_to_run=2,
+                        num_sites_per_search=10,
+                        use_advanced_filters=False,
+                    )
+                    return await searcher.invoke(prompt)
+
+                if researcher == "linkup":
+                    return await self._linkup_research(question)
+
+                if researcher == "exa":
+                    return await self._exa_research(question)
+
+                if researcher == "linkup+exa":
+                    return await self._linkup_exa_research(question)
+
+                if researcher in ("", "None", "no_research"):
+                    return ""
+
+        except Exception as exc:
+            logger.warning("Extra researcher failed for %s: %s", question.page_url, exc)
+
         return ""
 
     async def _linkup_research(self, question: MetaculusQuestion) -> str:
@@ -851,10 +1059,7 @@ class NikeBot(ForecastBot):
             linkup_search(q, max_results=8, depth="deep"),
             linkup_search(query_resolution, max_results=6, depth="deep"),
         )
-        combined: List[Dict[str, Any]] = [
-            *(linkup_1 or []),
-            *(linkup_2 or []),
-        ]
+        combined: List[Dict[str, Any]] = [*(linkup_1 or []), *(linkup_2 or [])]
         sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
 
         summarize_prompt = clean_indents(
@@ -863,11 +1068,8 @@ class NikeBot(ForecastBot):
             Task: produce a concise, decision-relevant briefing grounded in the retrieved
             sources. Do NOT produce a final forecast. Do NOT invent facts.
 
-            Question:
-            {q}
-
-            Resolution criteria:
-            {criteria}
+            Question: {q}
+            Resolution criteria: {criteria}
 
             Retrieved web snippets (ranked; each includes a URL):
             {sources_block}
@@ -901,11 +1103,7 @@ class NikeBot(ForecastBot):
             exa_search(query_resolution, max_results=8),
             exa_search(query_criteria_only, max_results=6),
         )
-        combined: List[Dict[str, Any]] = [
-            *(exa_1 or []),
-            *(exa_2 or []),
-            *(exa_3 or []),
-        ]
+        combined: List[Dict[str, Any]] = [*(exa_1 or []), *(exa_2 or []), *(exa_3 or [])]
         sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
 
         summarize_prompt = clean_indents(
@@ -914,11 +1112,8 @@ class NikeBot(ForecastBot):
             Task: produce a concise, decision-relevant briefing grounded in the retrieved
             sources. Do NOT produce a final forecast. Do NOT invent facts.
 
-            Question:
-            {q}
-
-            Resolution criteria:
-            {criteria}
+            Question: {q}
+            Resolution criteria: {criteria}
 
             Retrieved web snippets (ranked; each includes a URL):
             {sources_block}
@@ -955,11 +1150,8 @@ class NikeBot(ForecastBot):
             exa_search(query_criteria_only, max_results=6),
         )
         combined: List[Dict[str, Any]] = [
-            *(linkup_1 or []),
-            *(linkup_2 or []),
-            *(exa_1 or []),
-            *(exa_2 or []),
-            *(exa_3 or []),
+            *(linkup_1 or []), *(linkup_2 or []),
+            *(exa_1 or []), *(exa_2 or []), *(exa_3 or []),
         ]
         sources_block, urls = _rank_and_format_sources(combined, max_to_keep=14)
 
@@ -969,11 +1161,8 @@ class NikeBot(ForecastBot):
             Task: produce a concise, decision-relevant briefing grounded in the retrieved
             sources. Do NOT produce a final forecast. Do NOT invent facts.
 
-            Question:
-            {q}
-
-            Resolution criteria:
-            {criteria}
+            Question: {q}
+            Resolution criteria: {criteria}
 
             Retrieved web snippets (ranked; each includes a URL):
             {sources_block}
@@ -996,48 +1185,6 @@ class NikeBot(ForecastBot):
             """
         ).strip()
 
-    async def _openrouter_sonar_research(self, question: MetaculusQuestion) -> str:
-        q = question.question_text.strip()
-        criteria = (question.resolution_criteria or "").strip()
-        researcher = GeneralLlm(
-            model="openrouter/perplexity/sonar-pro",
-            temperature=0.15,
-            timeout=80,
-            allowed_tries=2,
-        )
-
-        base_prompt = clean_indents(
-            f"""
-            You are a research assistant for a conservative forecaster.
-            Produce a concise briefing for this question.
-
-            Question:
-            {q}
-
-            Resolution criteria:
-            {criteria}
-
-            Output requirements:
-            - Summarize the strongest evidence for each outcome.
-            - Identify the main risk or countervailing factor.
-            - Note the most important near-term event or signal that would shift the answer.
-            - Keep the response factual and direct.
-            """
-        )
-
-        prompts = [
-            base_prompt + "\nFocus first on the most recent authoritative signals and current status quo.",
-            base_prompt + "\nFocus on what would make the question resolve YES or NO and why those scenarios are plausible.",
-            base_prompt + "\nFocus on risks, uncertainties, and the most important unresolved evidence that could change the forecast.",
-        ]
-
-        results = await asyncio.gather(*(researcher.invoke(p) for p in prompts))
-        combined = "\n\n---\n\n".join(
-            f"Research pass {i+1}:\n{result.strip()}"
-            for i, result in enumerate(results, start=1)
-        )
-        return combined
-
     # -------------------------------------------------------------------------
     # Binary questions
     # -------------------------------------------------------------------------
@@ -1045,10 +1192,18 @@ class NikeBot(ForecastBot):
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
         self._binary_preds_this_question = []
+        today = datetime.now().strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
             You are a professional forecaster with a strong track record.
             Your job is to produce a well-calibrated but decisive probability estimate.
+
+            ⚠️  IMPORTANT — KNOWLEDGE CUTOFF WARNING ⚠️
+            Your training data has a cutoff. The research block below was retrieved
+            on {today} from live web sources. You MUST rely on the research block
+            for any recent facts, not on your training memory. Where the research
+            contradicts your training data, the research is more recent and takes
+            precedence.
 
             Question:
             {question.question_text}
@@ -1061,21 +1216,22 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Research findings:
+            ── LIVE RESEARCH (retrieved {today}) ──────────────────────────────
             {research}
+            ────────────────────────────────────────────────────────────────────
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {today}.
 
             Before stating your probability, write briefly:
             (a) Time remaining until resolution.
             (b) The status quo outcome if nothing changes.
-            (c) The strongest evidence pointing toward YES.
-            (d) The strongest evidence pointing toward NO.
+            (c) The strongest evidence from the RESEARCH pointing toward YES.
+            (d) The strongest evidence from the RESEARCH pointing toward NO.
             (e) Your overall read: which way does the evidence lean, and how strongly?
 
             IMPORTANT INSTRUCTIONS:
-            - Forecast based on the research and evidence. Do not bias the forecast
-              toward 50% unless the evidence is genuinely balanced.
+            - Forecast based on the LIVE RESEARCH above, not on your training priors.
+            - Do not bias the forecast toward 50% unless the evidence is genuinely balanced.
             - If you assess >75% likelihood, say so. If <25%, say so.
             - Good forecasters put extra weight on the status quo, but follow strong
               evidence when it exists.
@@ -1099,12 +1255,9 @@ class NikeBot(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         )
         raw_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-
-        # Calibration (default: no-op at scale 1.0)
         calibrated = 0.5 + (raw_pred - 0.5) * CALIBRATION_SCALE
         decimal_pred = max(0.01, min(0.99, calibrated))
 
-        # Per-run accumulation for early-stop check
         self._binary_preds_this_question.append(decimal_pred)
         n = len(self._binary_preds_this_question)
         if n >= 3:
@@ -1116,7 +1269,6 @@ class NikeBot(ForecastBot):
                     question.page_url, n, spread,
                 )
 
-        # Compress reasoning for Metaculus before logging
         compressed = await _compress_reasoning(
             self.get_llm("default", "llm"),
             reasoning,
@@ -1146,9 +1298,14 @@ class NikeBot(ForecastBot):
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
+        today = datetime.now().strftime("%Y-%m-%d")
         prompt = clean_indents(
             f"""
             You are a professional forecaster with a strong track record.
+
+            ⚠️  KNOWLEDGE CUTOFF WARNING: Your training data has a cutoff. The research
+            below was retrieved on {today} from live sources and takes precedence over
+            your training memory for any recent facts.
 
             Question:
             {question.question_text}
@@ -1162,10 +1319,11 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Research findings:
+            ── LIVE RESEARCH (retrieved {today}) ──────────────────────────────
             {research}
+            ────────────────────────────────────────────────────────────────────
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {today}.
 
             Before stating probabilities, write briefly:
             (a) Time remaining until resolution.
@@ -1174,10 +1332,9 @@ class NikeBot(ForecastBot):
 
             IMPORTANT INSTRUCTIONS:
             - If evidence strongly favours one option, reflect that in the probabilities.
-              Avoid artificially spreading mass across all options when evidence is clear.
-            - Keep some residual probability on each option for genuine uncertainty, but
-              do not sacrifice sharpness — a 50% when evidence says 80% is a poor forecast.
-            - Good forecasters put extra weight on the status quo but update hard on evidence.
+            - Avoid artificially spreading mass across all options when evidence is clear.
+            - Keep some residual probability on each option for genuine uncertainty.
+            - Rely on the LIVE RESEARCH above, not on training priors.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final probabilities for the N options in this
@@ -1214,7 +1371,6 @@ class NikeBot(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        # Compress for Metaculus
         compressed = await _compress_reasoning(
             self.get_llm("default", "llm"),
             reasoning,
@@ -1270,10 +1426,15 @@ class NikeBot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
         bound_enforcement = self._create_bound_enforcement_message(question)
+        today = datetime.now().strftime("%Y-%m-%d")
 
         base_prompt = clean_indents(
             f"""
             You are a professional forecaster with a strong track record.
+
+            ⚠️  KNOWLEDGE CUTOFF WARNING: Your training data has a cutoff. The research
+            below was retrieved on {today} from live sources and takes precedence over
+            your training memory for any recent facts.
 
             Question:
             {question.question_text}
@@ -1287,10 +1448,11 @@ class NikeBot(ForecastBot):
 
             Units: {question.unit_of_measure or "Not stated (please infer this)"}
 
-            Research findings:
+            ── LIVE RESEARCH (retrieved {today}) ──────────────────────────────
             {research}
+            ────────────────────────────────────────────────────────────────────
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {today}.
 
             {lower_msg}
             {upper_msg}
@@ -1306,13 +1468,12 @@ class NikeBot(ForecastBot):
             (a) Time remaining.
             (b) The outcome if nothing changes.
             (c) The outcome if the current trend continues.
-            (d) Expert / market expectations.
+            (d) Expert / market expectations per the LIVE RESEARCH.
             (e) A plausible low outcome (still above lower bound).
             (f) A plausible high outcome (still below upper bound).
 
             IMPORTANT: If research clearly points to a specific range, your percentiles
-            should reflect that — don't spread mass uniformly across the full range when
-            evidence narrows it.
+            should reflect that. Rely on the LIVE RESEARCH above, not on training priors.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
@@ -1464,10 +1625,15 @@ class NikeBot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
         bound_enforcement = self._create_bound_enforcement_message(question)
+        today = datetime.now().strftime("%Y-%m-%d")
 
         base_prompt = clean_indents(
             f"""
             You are a professional forecaster with a strong track record.
+
+            ⚠️  KNOWLEDGE CUTOFF WARNING: Your training data has a cutoff. The research
+            below was retrieved on {today} from live sources and takes precedence over
+            your training memory for any recent facts.
 
             Question:
             {question.question_text}
@@ -1479,10 +1645,11 @@ class NikeBot(ForecastBot):
 
             {question.fine_print}
 
-            Research findings:
+            ── LIVE RESEARCH (retrieved {today}) ──────────────────────────────
             {research}
+            ────────────────────────────────────────────────────────────────────
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Today is {today}.
 
             {lower_msg}
             {upper_msg}
@@ -1497,12 +1664,12 @@ class NikeBot(ForecastBot):
             (a) Time remaining.
             (b) The outcome if nothing changes.
             (c) The outcome if the current trend continues.
-            (d) Expert / market expectations.
+            (d) Expert / market expectations per the LIVE RESEARCH.
             (e) A plausible early outcome (still after lower bound).
             (f) A plausible late outcome (still before upper bound).
 
             IMPORTANT: If research clearly narrows the likely date, your percentiles
-            should reflect that — don't spread uniformly when evidence is concentrated.
+            should reflect that. Rely on the LIVE RESEARCH above, not on training priors.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
@@ -1828,18 +1995,27 @@ class NikeBot(ForecastBot):
 
 
 # ---------------------------------------------------------------------------
-# Startup banner (logs only — never touches Metaculus reasoning)
+# Startup banner
 # ---------------------------------------------------------------------------
 def _log_startup_banner(mode: str, dry_run: bool) -> None:
+    sources: List[str] = []
+    if EXA_API_KEY:
+        sources.append("Exa")
+    if LINKUP_API_KEY:
+        sources.append("Linkup")
+    if ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET:
+        sources.append("AskNews")
+    sources_str = ", ".join(sources) if sources else "none (LLM priors only)"
+
     logger.info("=" * 60)
     logger.info("  Nike Bot  —  Just Forecast It.")
     logger.info("  Mode          : %s%s", mode, "  [DRY RUN]" if dry_run else "")
+    logger.info("  Default model : %s", OPENROUTER_DEFAULT_MODEL)
+    logger.info("  Live sources  : %s", sources_str)
     logger.info("  CalibScale    : %.2f (1.0 = no regression)", CALIBRATION_SCALE)
     logger.info("  ExtremizeScale: %.2f (>1.0 = push from 0.5)", EXTREMIZE_SCALE)
     logger.info("  EarlyStop     : %.2f log-odds stdev", EARLY_STOP_TOLERANCE)
     logger.info("  RunLog        : %s", RUN_LOG_PATH if RUN_LOG_PATH else "disabled")
-    logger.info("  LinkUp        : %s", "configured" if LINKUP_API_KEY else "not configured")
-    logger.info("  Exa           : %s", "configured" if EXA_API_KEY else "not configured")
     logger.info("=" * 60)
 
 
@@ -1848,36 +2024,20 @@ def _log_startup_banner(mode: str, dry_run: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def _evidence_suggests_extremization(forecast: dict) -> bool:
-    """
-    Check if the forecast's explanation suggests strong evidence for extremization.
-    Returns True if evidence indicates the prediction should be extremized.
-    """
     if not isinstance(forecast, dict) or 'explanation' not in forecast:
         return False
-    
     explanation = forecast.get('explanation', '').lower()
-    
-    # Check for strong evidence keywords
     strong_evidence_keywords = [
         'strong evidence', 'highly confident', 'clear indication', 'overwhelming',
         'compelling evidence', 'definitive', 'certain', 'conclusive',
         'robust evidence', 'solid foundation', 'high confidence'
     ]
-    
     has_keywords = any(keyword in explanation for keyword in strong_evidence_keywords)
-    
-    # Check explanation length as proxy for detailed reasoning
     is_detailed = len(explanation) > 500
-    
     return has_keywords or is_detailed
 
 
 def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
-    """
-    Apply aggressive extremization to minibench forecasts.
-    - High forecasts (>= MINIBENCH_EXTREMIZE_HIGH_CEILING) are pushed toward MINIBENCH_EXTREMIZE_HIGH_ROOF.
-    - Low forecasts (<= MINIBENCH_EXTREMIZE_LOW_THRESHOLD) are pushed toward MINIBENCH_EXTREMIZE_LOW_FLOOR.
-    """
     extremized = []
     for forecast in forecasts:
         if isinstance(forecast, Exception):
@@ -1890,18 +2050,10 @@ def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
                     pred = forecast_copy["decimal_pred"]
                     if pred >= MINIBENCH_EXTREMIZE_HIGH_CEILING:
                         forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_HIGH_ROOF
-                        logger.info(
-                            "Minibench: Extremized high forecast %.2f → %.2f",
-                            pred,
-                            MINIBENCH_EXTREMIZE_HIGH_ROOF,
-                        )
+                        logger.info("Minibench: Extremized high %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_HIGH_ROOF)
                     elif pred <= MINIBENCH_EXTREMIZE_LOW_THRESHOLD:
                         forecast_copy["decimal_pred"] = MINIBENCH_EXTREMIZE_LOW_FLOOR
-                        logger.info(
-                            "Minibench: Extremized low forecast %.2f → %.2f",
-                            pred,
-                            MINIBENCH_EXTREMIZE_LOW_FLOOR,
-                        )
+                        logger.info("Minibench: Extremized low %.2f → %.2f", pred, MINIBENCH_EXTREMIZE_LOW_FLOOR)
                 extremized.append(forecast_copy)
             else:
                 extremized.append(forecast)
@@ -1912,35 +2064,24 @@ def _extremize_minibench_forecasts(forecasts: List[Any]) -> List[Any]:
 
 
 def _extremize_spring_forecasts(forecasts: List[Any]) -> List[Any]:
-    """
-    Apply conservative extremization to spring forecasts to avoid overconfidence.
-    - High forecasts (>= SPRING_EXTREMIZE_HIGH_CEILING) are pushed toward SPRING_EXTREMIZE_HIGH_ROOF
-    - Low forecasts (<= SPRING_EXTREMIZE_LOW_THRESHOLD) are pushed toward SPRING_EXTREMIZE_LOW_FLOOR
-    Only extremizes if _evidence_suggests_extremization returns True.
-    Uses more conservative thresholds than minibench.
-    """
     extremized = []
     for forecast in forecasts:
         if isinstance(forecast, Exception):
             extremized.append(forecast)
             continue
         try:
-            # If it's a dict with prediction/decimal info, check for extremization
             if isinstance(forecast, dict):
                 forecast_copy = forecast.copy()
                 if "decimal_pred" in forecast_copy:
                     pred = forecast_copy["decimal_pred"]
                     evidence_strong = _evidence_suggests_extremization(forecast)
-                    
                     if evidence_strong:
                         if pred >= SPRING_EXTREMIZE_HIGH_CEILING:
                             forecast_copy["decimal_pred"] = SPRING_EXTREMIZE_HIGH_ROOF
-                            logger.info("Spring: Extremized high forecast %.2f → %.2f (conservative)", pred, SPRING_EXTREMIZE_HIGH_ROOF)
+                            logger.info("Spring: Extremized high %.2f → %.2f", pred, SPRING_EXTREMIZE_HIGH_ROOF)
                         elif pred <= SPRING_EXTREMIZE_LOW_THRESHOLD:
                             forecast_copy["decimal_pred"] = SPRING_EXTREMIZE_LOW_FLOOR
-                            logger.info("Spring: Extremized low forecast %.2f → %.2f (conservative)", pred, SPRING_EXTREMIZE_LOW_FLOOR)
-                        else:
-                            logger.info("Spring: Forecast %.2f not extremized (below thresholds despite evidence)", pred)
+                            logger.info("Spring: Extremized low %.2f → %.2f", pred, SPRING_EXTREMIZE_LOW_FLOOR)
                     else:
                         logger.info("Spring: Forecast %.2f not extremized (weak evidence)", pred)
                 extremized.append(forecast_copy)
@@ -1952,18 +2093,13 @@ def _extremize_spring_forecasts(forecasts: List[Any]) -> List[Any]:
     return extremized
 
 
-async def _conditionally_forecast_spring(client, bot) -> List[Any]:
-    """
-    Always forecast on Spring contest with conservative extremization to avoid overconfidence.
-    """
+async def _conditionally_forecast_spring(client: Any, bot: Any) -> List[Any]:
     logger.info("Spring contest: Forecasting with conservative extremization...")
     try:
         spring_results = await bot.forecast_on_tournament(
             SPRING_2026_AI_BENCHMARKING_SLUG, return_exceptions=True
         )
-        # Apply conservative extremization to spring forecasts
-        extremized_spring = _extremize_spring_forecasts(spring_results)
-        return list(extremized_spring)
+        return list(_extremize_spring_forecasts(spring_results))
     except Exception as e:
         logger.warning("Error forecasting on spring contest: %s", e)
         return []
@@ -2003,10 +2139,13 @@ if __name__ == "__main__":
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
         extra_metadata_in_explanation=False,
         dry_run=dry_run,
         llms={
+            # ── Forecast & parse ─────────────────────────────────────────────
+            # Free OpenRouter model. Override OPENROUTER_DEFAULT_MODEL env var
+            # to swap in any other model (free or paid) without code changes.
             "default": GeneralLlm(
                 model=OPENROUTER_DEFAULT_MODEL,
                 temperature=0.2,
@@ -2019,18 +2158,20 @@ if __name__ == "__main__":
                 timeout=60,
                 allowed_tries=2,
             ),
-            # Choose one researcher backend by commenting / uncommenting:
-            # "researcher": "asknews/news-summaries",
-            # "researcher": "smart-searcher/openai/gpt-4o-mini",
-            # "researcher": "linkup+exa",
-            "researcher": ["openrouter/perplexity/sonar-pro",
-            ],
             "parser": GeneralLlm(
                 model=OPENROUTER_PARSER_MODEL,
                 temperature=0.0,
                 timeout=60,
                 allowed_tries=2,
             ),
+            # ── Optional extra researcher ─────────────────────────────────────
+            # The multi-source engine (Exa + Linkup + AskNews) always runs first.
+            # Uncomment ONE of the lines below to add an extra research pass on
+            # top of the base sources. Leave all commented out if not needed.
+            #
+            # "researcher": "asknews/deep-research/medium-depth",
+            # "researcher": "smart-searcher/openrouter/meta-llama/llama-4-maverick:free",
+            # "researcher": "linkup+exa",
         },
     )
 
@@ -2047,24 +2188,22 @@ if __name__ == "__main__":
         seasonal = await nike_bot.forecast_on_tournament(
             AI_TOURNAMENT_ID, return_exceptions=True
         )
-        
-        # Validate and forecast on minibench if available with extremization
-        minibench_ok = await client.validate_tournament_slug(
-            client.CURRENT_MINIBENCH_ID
-        ) if hasattr(client.CURRENT_MINIBENCH_ID, 'lower') else True
+
+        minibench_ok = (
+            await client.validate_tournament_slug(client.CURRENT_MINIBENCH_ID)
+            if hasattr(client, "CURRENT_MINIBENCH_ID")
+               and isinstance(client.CURRENT_MINIBENCH_ID, str)
+            else True
+        )
         if not minibench_ok:
-            logger.error(
-                "Minibench tournament '%s' is not available — skipping minibench.",
-                client.CURRENT_MINIBENCH_ID,
-            )
-            minibench = []
+            logger.error("Minibench tournament not available — skipping.")
+            minibench: List[Any] = []
         else:
             minibench_raw = await nike_bot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
-            # Apply extremization to minibench forecasts for both high and low ends
             minibench = _extremize_minibench_forecasts(minibench_raw)
-        
+
         market_pulse: List[Any] = (
             await nike_bot.forecast_on_tournament(
                 MARKET_PULSE_TOURNAMENT_SLUG, return_exceptions=True
@@ -2072,7 +2211,6 @@ if __name__ == "__main__":
             if slug_ok
             else []
         )
-        # Conditionally forecast on Spring contest only if high confidence
         spring_results = await _conditionally_forecast_spring(client, nike_bot)
         return list(seasonal) + list(minibench) + list(market_pulse) + spring_results
 
@@ -2103,3 +2241,4 @@ if __name__ == "__main__":
         forecast_reports = asyncio.run(_run_test_mode())
 
     nike_bot.log_report_summary(forecast_reports)
+
