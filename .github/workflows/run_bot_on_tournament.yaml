@@ -48,6 +48,7 @@ jobs:
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          VULTR_API_KEY: ${{ secrets.VULTR_SERVERLESS_INFERENCE_API_KEY }}
           VULTR_SERVERLESS_INFERENCE_API_KEY: ${{ secrets.VULTR_SERVERLESS_INFERENCE_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}

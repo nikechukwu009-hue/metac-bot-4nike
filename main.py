@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import dotenv
 import httpx
 
+from forecasting_tools.ai_models.model_interfaces.outputs_text import OutputsText
+from forecasting_tools.ai_models.model_interfaces.retryable_model import RetryableModel
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -52,7 +54,9 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 
 # Vultr serverless inference config.
 # Override via env to swap in any other Vultr-compatible model without code changes.
-VULTR_API_KEY = os.getenv("VULTR_API_KEY", "")
+VULTR_API_KEY = os.getenv("VULTR_API_KEY") or os.getenv(
+    "VULTR_SERVERLESS_INFERENCE_API_KEY", ""
+)
 VULTR_API_URL = os.getenv(
     "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
 )
@@ -67,21 +71,12 @@ EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET", "")
 
-VULTR_API_KEY = os.getenv("VULTR_API_KEY", "")
-VULTR_API_URL = os.getenv(
-    "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
-)
-VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
-VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
-VULTR_PARSER_MODEL = os.getenv("VULTR_PARSER_MODEL", VULTR_DEFAULT_MODEL)
-VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
-
 LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
 EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 
-class VultrLlm:
+class VultrLlm(OutputsText, RetryableModel):
     def __init__(
         self,
         model: str,
@@ -91,12 +86,23 @@ class VultrLlm:
         max_output_tokens: int = VULTR_MAX_OUTPUT_TOKENS,
         api_url: Optional[str] = None,
     ) -> None:
+        super().__init__(allowed_tries=max(1, allowed_tries))
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
-        self.allowed_tries = allowed_tries
         self.max_output_tokens = max_output_tokens
         self.api_url = api_url or VULTR_API_URL
+
+    async def _mockable_direct_call_to_model(self, input: Any) -> str:
+        return await self.invoke(input)
+
+    @staticmethod
+    def _get_mock_return_for_direct_call_to_model_using_cheap_input() -> str:
+        return "mock vultr response"
+
+    @staticmethod
+    def _get_cheap_input_for_invoke() -> str:
+        return "test"
 
     async def invoke(self, prompt: str) -> str:
         if not VULTR_API_KEY:
@@ -771,7 +777,7 @@ _run_logger = RunLogger(RUN_LOG_PATH)
 # ---------------------------------------------------------------------------
 
 async def _compress_reasoning(
-    llm: GeneralLlm,
+    llm: Union[GeneralLlm, VultrLlm],
     full_reasoning: str,
     question_text: str,
     final_prediction_str: str,
@@ -988,6 +994,34 @@ class NikeBot(ForecastBot):
         self._question_cache = QuestionCache()
         self._binary_preds_this_question: List[float] = []
 
+    def get_llm(
+        self,
+        purpose: str = "default",
+        guarantee_type: Optional[Literal["llm", "string_name"]] = None,
+    ) -> Union[GeneralLlm, VultrLlm, str]:
+        """
+        forecasting-tools wraps non-GeneralLlm values in GeneralLlm(model=...), which
+        breaks custom providers like VultrLlm. Return VultrLlm instances as-is.
+        """
+        if purpose not in self._llms:
+            raise ValueError(
+                f"Unknown llm requested from llm dict for purpose: '{purpose}'"
+            )
+
+        llm = self._llms[purpose]
+        if llm is None:
+            raise ValueError(
+                f"LLM is undefined for purpose: {purpose}. It was probably not defined in defaults."
+            )
+
+        if isinstance(llm, VultrLlm):
+            if guarantee_type is None or guarantee_type == "llm":
+                return llm
+            if guarantee_type == "string_name":
+                return llm.model
+
+        return super().get_llm(purpose, guarantee_type)
+
     # -------------------------------------------------------------------------
     # Retry addendum builder
     # -------------------------------------------------------------------------
@@ -1068,6 +1102,9 @@ class NikeBot(ForecastBot):
         Returns '' if no researcher key is configured or the call fails.
         This is additive — it supplements, not replaces, the multi-source research.
         """
+        if "researcher" not in self._llms:
+            return ""
+
         researcher = self.get_llm("researcher")
         if researcher is None:
             return ""
@@ -1091,7 +1128,7 @@ class NikeBot(ForecastBot):
         )
 
         try:
-            if isinstance(researcher, GeneralLlm):
+            if isinstance(researcher, (GeneralLlm, VultrLlm)):
                 return await researcher.invoke(prompt)
 
             if isinstance(researcher, str):
