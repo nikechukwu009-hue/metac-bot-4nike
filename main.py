@@ -87,6 +87,161 @@ _VULTR_SYSTEM_PROMPT = (
 _PERCENTILE_ANSWER_RE = re.compile(
     r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:,\d{3})*)"
 )
+_DATE_ANSWER_RE = re.compile(
+    r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*(\d{4}-\d{2}-\d{2})"
+)
+_EXPECTED_PERCENTILE_LEVELS = (10, 20, 40, 60, 80, 90)
+
+
+def _parse_numeric_token(value: str) -> float:
+    return float(value.replace(",", "").strip())
+
+
+def _extract_percentile_lines(text: str) -> str:
+    lines: List[str] = []
+    for line in text.splitlines():
+        if _PERCENTILE_ANSWER_RE.search(line) or _DATE_ANSWER_RE.search(line):
+            lines.append(line.strip())
+    if len(lines) >= 4:
+        return "\n".join(lines)
+    return text
+
+
+def _try_parse_percentile_json(text: str) -> Optional[List[Percentile]]:
+    start = text.find("[")
+    if start == -1:
+        return None
+
+    for end in range(len(text), start + 1, -1):
+        if text[end - 1] != "]":
+            continue
+        try:
+            data = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, list) or len(data) < 4:
+            continue
+
+        parsed: List[Percentile] = []
+        for item in data:
+            if not isinstance(item, dict):
+                break
+            pct_raw = item.get("percentile")
+            value_raw = item.get("value")
+            if pct_raw is None or value_raw is None:
+                break
+            pct = float(pct_raw)
+            if pct > 1:
+                pct /= 100.0
+            parsed.append(Percentile(percentile=pct, value=_parse_numeric_token(str(value_raw))))
+        if len(parsed) >= 4:
+            return parsed
+    return None
+
+
+def _parse_percentiles_from_text(text: str) -> List[Percentile]:
+    text = _extract_percentile_lines(_coerce_vultr_response_text(text))
+
+    from_json = _try_parse_percentile_json(text)
+    if from_json is not None:
+        return from_json
+
+    matches = _PERCENTILE_ANSWER_RE.findall(text)
+    if len(matches) < 4:
+        raise ValueError("Could not find enough percentile lines in forecast text")
+
+    pct_map: Dict[int, float] = {}
+    for pct_str, value_str in matches:
+        pct_map[int(pct_str)] = _parse_numeric_token(value_str)
+
+    parsed = [
+        Percentile(percentile=pct / 100.0, value=pct_map[pct])
+        for pct in _EXPECTED_PERCENTILE_LEVELS
+        if pct in pct_map
+    ]
+    if len(parsed) < 4:
+        raise ValueError("Incomplete percentile set in forecast text")
+    return parsed
+
+
+def _parse_date_percentiles_from_text(text: str) -> List[DatePercentile]:
+    text = _extract_percentile_lines(_coerce_vultr_response_text(text))
+    matches = _DATE_ANSWER_RE.findall(text)
+    if len(matches) < 4:
+        raise ValueError("Could not find enough date percentile lines in forecast text")
+
+    pct_map: Dict[int, datetime] = {}
+    for pct_str, date_str in matches:
+        pct_map[int(pct_str)] = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+
+    parsed = [
+        DatePercentile(percentile=pct / 100.0, value=pct_map[pct])
+        for pct in _EXPECTED_PERCENTILE_LEVELS
+        if pct in pct_map
+    ]
+    if len(parsed) < 4:
+        raise ValueError("Incomplete date percentile set in forecast text")
+    return parsed
+
+
+async def _parse_percentiles_with_fallback(
+    text: str,
+    question: NumericQuestion,
+    parser_llm: Union[GeneralLlm, VultrLlm],
+    validation_samples: int,
+) -> List[Percentile]:
+    try:
+        return _parse_percentiles_from_text(text)
+    except ValueError:
+        pass
+
+    parsing_instructions = clean_indents(
+        f"""
+        The text is a forecast distribution for a numeric question.
+        Question: "{question.question_text}"
+        Units: {question.unit_of_measure}
+        Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
+        Return ONLY a JSON array of objects with "percentile" (0-1) and "value" keys.
+        No prose before or after the JSON.
+        """
+    )
+    return await structure_output(
+        _extract_percentile_lines(text),
+        list[Percentile],
+        model=parser_llm,
+        additional_instructions=parsing_instructions,
+        num_validation_samples=validation_samples,
+    )
+
+
+async def _parse_date_percentiles_with_fallback(
+    text: str,
+    question: DateQuestion,
+    parser_llm: Union[GeneralLlm, VultrLlm],
+    validation_samples: int,
+) -> List[DatePercentile]:
+    try:
+        return _parse_date_percentiles_from_text(text)
+    except ValueError:
+        pass
+
+    parsing_instructions = clean_indents(
+        f"""
+        The text is a forecast distribution for a date question.
+        Question: "{question.question_text}"
+        Bounds: {question.lower_bound.date().isoformat()} to
+                {question.upper_bound.date().isoformat()}
+        Return ONLY a JSON array of objects with "percentile" (0-1) and "value" keys.
+        No prose before or after the JSON.
+        """
+    )
+    return await structure_output(
+        _extract_percentile_lines(text),
+        list[DatePercentile],
+        model=parser_llm,
+        additional_instructions=parsing_instructions,
+        num_validation_samples=validation_samples,
+    )
 
 
 def _vultr_inference_model_id(model: str) -> str:
@@ -153,51 +308,50 @@ async def _finalize_forecast_text(
     text = _coerce_vultr_response_text(analysis_text)
 
     if answer_kind == "percentiles" and _has_percentile_answer(text):
-        return text
+        return _extract_percentile_lines(text)
     if answer_kind == "binary" and _has_binary_answer(text):
         return text
     if answer_kind == "dates" and re.search(
         r"(?:[Pp]ercentile\s*)?(?:10|20|40|60|80|90)\s*[:=]\s*\d{4}-\d{2}-\d{2}", text
     ):
-        return text
+        return _extract_percentile_lines(text)
 
     if answer_kind == "percentiles":
-        answer_format = (
-            "Percentile 10: XX\n"
-            "Percentile 20: XX\n"
-            "Percentile 40: XX\n"
-            "Percentile 60: XX\n"
-            "Percentile 80: XX\n"
-            "Percentile 90: XX"
+        example = (
+            "Percentile 10: -2.5\n"
+            "Percentile 20: -1.0\n"
+            "Percentile 40: 0.5\n"
+            "Percentile 60: 1.5\n"
+            "Percentile 80: 3.0\n"
+            "Percentile 90: 5.0"
         )
     elif answer_kind == "dates":
-        answer_format = (
-            "Percentile 10: YYYY-MM-DD\n"
-            "Percentile 20: YYYY-MM-DD\n"
-            "Percentile 40: YYYY-MM-DD\n"
-            "Percentile 60: YYYY-MM-DD\n"
-            "Percentile 80: YYYY-MM-DD\n"
-            "Percentile 90: YYYY-MM-DD"
+        example = (
+            "Percentile 10: 2026-07-15\n"
+            "Percentile 20: 2026-08-01\n"
+            "Percentile 40: 2026-09-01\n"
+            "Percentile 60: 2026-10-01\n"
+            "Percentile 80: 2026-11-01\n"
+            "Percentile 90: 2026-12-01"
         )
     else:
-        answer_format = "Probability: ZZ%"
+        example = "Probability: 35%"
 
-    follow_up = clean_indents(
-        f"""
-        You already analyzed this forecasting question. Output ONLY the final answer
-        block below with numeric values filled in. No analysis, headings, or JSON.
-
-        Question:
-        {question_hint}
-
-        Required final answer format:
-        {answer_format}
-
-        Prior analysis:
-        {text[:6000]}
-        """
+    follow_up = (
+        "Using the prior analysis below, reply with exactly six forecast lines and "
+        "nothing else. No JSON, markdown, headings, or explanation.\n\n"
+        f"Example format:\n{example}\n\n"
+        f"Question: {question_hint}\n\n"
+        f"Prior analysis:\n{text[:5000]}"
     )
     finalized = _coerce_vultr_response_text(await llm.invoke(follow_up))
+    finalized = _extract_percentile_lines(finalized)
+    if answer_kind == "percentiles" and _has_percentile_answer(finalized):
+        return finalized
+    if answer_kind == "binary" and _has_binary_answer(finalized):
+        return finalized
+    if answer_kind == "dates" and _DATE_ANSWER_RE.search(finalized):
+        return finalized
     return finalized or text
 
 
@@ -976,7 +1130,7 @@ class NikeBot(ForecastBot):
     def __init__(self, *args: Any, dry_run: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._concurrency_limiter = asyncio.Semaphore(self._max_concurrent_questions)
-        self._structure_output_validation_samples = 2
+        self._structure_output_validation_samples = 1
         self.dry_run = dry_run
         self._question_cache = QuestionCache()
         self._binary_preds_this_question: List[float] = []
@@ -1485,24 +1639,11 @@ class NikeBot(ForecastBot):
                     question.page_url, attempt + 1, reasoning,
                 )
 
-                parsing_instructions = clean_indents(
-                    f"""
-                    The text is a forecast distribution for a numeric question.
-                    Question: "{question.question_text}"
-                    Units: {question.unit_of_measure}
-                    Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
-                    - Parse values in the correct units.
-                    - No scientific notation.
-                    - NEVER return values outside [{question.lower_bound}, {question.upper_bound}].
-                    """
-                )
-
-                percentile_list: List[Percentile] = await structure_output(
+                percentile_list = await _parse_percentiles_with_fallback(
                     reasoning,
-                    list[Percentile],
-                    model=self.get_llm("parser", "llm"),
-                    additional_instructions=parsing_instructions,
-                    num_validation_samples=self._structure_output_validation_samples,
+                    question,
+                    self.get_llm("parser", "llm"),
+                    self._structure_output_validation_samples,
                 )
 
                 percentile_list = _sort_percentiles_monotone(percentile_list)
@@ -1547,10 +1688,10 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except AssertionError as exc:
+            except (AssertionError, ValueError) as exc:
                 last_error = exc
                 logger.warning(
-                    "AssertionError on numeric attempt %d for %s: %s",
+                    "Numeric parse failed on attempt %d for %s: %s",
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
@@ -1689,24 +1830,11 @@ class NikeBot(ForecastBot):
                     question.page_url, attempt + 1, reasoning,
                 )
 
-                parsing_instructions = clean_indents(
-                    f"""
-                    The text is a forecast distribution for a date question.
-                    Question: "{question.question_text}"
-                    Bounds: {question.lower_bound.date().isoformat()} to
-                            {question.upper_bound.date().isoformat()}
-                    - Format each date as a valid parseable datetime string.
-                    - Assume midnight UTC if no time is given.
-                    - All dates MUST fall within the stated bounds.
-                    """
-                )
-
-                date_percentile_list: List[DatePercentile] = await structure_output(
+                date_percentile_list = await _parse_date_percentiles_with_fallback(
                     reasoning,
-                    list[DatePercentile],
-                    model=self.get_llm("parser", "llm"),
-                    additional_instructions=parsing_instructions,
-                    num_validation_samples=self._structure_output_validation_samples,
+                    question,
+                    self.get_llm("parser", "llm"),
+                    self._structure_output_validation_samples,
                 )
 
                 clipped, was_clipped = self._clip_date_percentiles(
@@ -1750,10 +1878,10 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except AssertionError as exc:
+            except (AssertionError, ValueError) as exc:
                 last_error = exc
                 logger.warning(
-                    "AssertionError on date attempt %d for %s: %s",
+                    "Date parse failed on attempt %d for %s: %s",
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
