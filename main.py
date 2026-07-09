@@ -119,11 +119,41 @@ def _strip_instruction_echo(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _strip_meta_before_percentiles(text: str) -> str:
+    if not _has_percentile_answer(text) and not _DATE_ANSWER_RE.search(text):
+        return text
+    match = re.search(
+        r"(?:^|\n)\s*(?:[Pp]ercentile\s*)?10\s*[:=]",
+        text,
+    )
+    if match:
+        return text[match.start() :].strip()
+    return text
+
+
 def _parse_numeric_token(value: str) -> float:
     return float(value.replace(",", "").strip())
 
 
 def _extract_percentile_lines(text: str) -> str:
+    text = _strip_meta_before_percentiles(text)
+    last_by_level: Dict[int, str] = {}
+    for line in text.splitlines():
+        numeric_match = _PERCENTILE_ANSWER_RE.search(line)
+        if numeric_match:
+            last_by_level[int(numeric_match.group(1))] = line.strip()
+            continue
+        date_match = _DATE_ANSWER_RE.search(line)
+        if date_match:
+            last_by_level[int(date_match.group(1))] = line.strip()
+
+    if len(last_by_level) >= 4:
+        return "\n".join(
+            last_by_level[level]
+            for level in _EXPECTED_PERCENTILE_LEVELS
+            if level in last_by_level
+        )
+
     lines: List[str] = []
     for line in text.splitlines():
         if _PERCENTILE_ANSWER_RE.search(line) or _DATE_ANSWER_RE.search(line):
@@ -316,7 +346,12 @@ def _vultr_inference_model_id(model: str) -> str:
 
 def _merge_assistant_message(message: Any) -> str:
     if not isinstance(message, dict):
-        return _strip_instruction_echo(_coerce_vultr_response_text(str(message)))
+        return _coerce_vultr_response_text(str(message))
+
+    if "message" in message and isinstance(message["message"], dict):
+        nested = _merge_assistant_message(message["message"])
+        if nested:
+            return nested
 
     content = message.get("content")
     content_str = content.strip() if isinstance(content, str) else ""
@@ -331,36 +366,25 @@ def _merge_assistant_message(message: Any) -> str:
     text_value = message.get("text")
     text_str = text_value.strip() if isinstance(text_value, str) else ""
 
-    if content_str and (
-        _has_percentile_answer(content_str)
-        or _has_binary_answer(content_str)
-        or re.search(r"\d{4}-\d{2}-\d{2}", content_str)
-    ):
-        return _extract_percentile_lines(content_str)
+    candidates = [s for s in (content_str, reasoning_str, text_str) if s]
+    if not candidates:
+        return ""
 
-    if content_str and not reasoning_str:
-        return _strip_instruction_echo(content_str)
+    combined = "\n\n".join(candidates)
+    if _has_percentile_answer(combined) or _DATE_ANSWER_RE.search(combined):
+        extracted = _extract_percentile_lines(combined)
+        if _has_percentile_answer(extracted) or _DATE_ANSWER_RE.search(extracted):
+            return extracted
 
-    if reasoning_str and not content_str:
-        if _has_percentile_answer(reasoning_str):
-            return _extract_percentile_lines(reasoning_str)
-        return _strip_instruction_echo(reasoning_str)
+    if _has_binary_answer(combined):
+        for candidate in (content_str, reasoning_str, text_str):
+            if candidate and _has_binary_answer(candidate):
+                return candidate
 
-    if content_str and reasoning_str:
-        combined = f"{reasoning_str}\n\n{content_str}"
-        if _has_percentile_answer(combined):
-            return _extract_percentile_lines(combined)
-        if _has_binary_answer(content_str):
-            return content_str
-        return _strip_instruction_echo(content_str or reasoning_str)
-
-    if text_str:
-        return _strip_instruction_echo(text_str)
-
-    if "message" in message:
-        return _merge_assistant_message(message["message"])
-
-    return _strip_instruction_echo(_coerce_vultr_response_text(json.dumps(message)))
+    substantive = [s for s in candidates if len(s) >= 20]
+    if substantive:
+        return max(substantive, key=len)
+    return max(candidates, key=len)
 
 
 def _coerce_vultr_response_text(raw: str) -> str:
@@ -402,7 +426,7 @@ async def _finalize_forecast_text(
     text = _coerce_vultr_response_text(analysis_text)
 
     if answer_kind == "percentiles" and _has_percentile_answer(text):
-        return _extract_percentile_lines(text)
+        return _extract_percentile_lines(_strip_instruction_echo(text))
     if answer_kind == "binary" and _has_binary_answer(text):
         return text
     if answer_kind == "dates" and re.search(
@@ -439,14 +463,17 @@ async def _finalize_forecast_text(
         f"Prior analysis:\n{text[:5000]}"
     )
     finalized = _coerce_vultr_response_text(await llm.invoke(follow_up))
-    finalized = _extract_percentile_lines(finalized)
+    finalized = _extract_percentile_lines(_strip_instruction_echo(finalized))
     if answer_kind == "percentiles" and _has_percentile_answer(finalized):
         return finalized
     if answer_kind == "binary" and _has_binary_answer(finalized):
         return finalized
     if answer_kind == "dates" and _DATE_ANSWER_RE.search(finalized):
         return finalized
-    return finalized or text
+
+    if answer_kind == "percentiles" and _has_percentile_answer(text):
+        return _extract_percentile_lines(text)
+    return finalized or _extract_percentile_lines(text) or text
 
 
 class VultrLlm(OutputsText, RetryableModel):
@@ -524,25 +551,21 @@ class VultrLlm(OutputsText, RetryableModel):
             if isinstance(value, str):
                 return value
             if isinstance(value, dict):
-                if "message" in value:
-                    merged = _merge_assistant_message(value["message"])
-                    if merged:
-                        return merged
                 merged = _merge_assistant_message(value)
-                if merged and not merged.startswith("{"):
+                if merged:
                     return merged
                 for key in ("output", "result", "text", "content", "reasoning", "reasoning_content"):
                     if key in value:
                         extracted = _extract_text(value[key])
                         if extracted:
                             return extracted
-                return json.dumps(value)
+                return ""
             if isinstance(value, list):
-                if value and isinstance(value[0], dict):
-                    extracted = _extract_text(value[0])
+                for item in value:
+                    extracted = _extract_text(item)
                     if extracted:
                         return extracted
-                return " ".join(_extract_text(item) for item in value if item is not None)
+                return ""
             return str(value)
 
         output = _coerce_vultr_response_text(
