@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import inspect
@@ -63,19 +65,144 @@ VULTR_API_URL = os.getenv(
 VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
 VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
 VULTR_PARSER_MODEL = os.getenv("VULTR_PARSER_MODEL", VULTR_DEFAULT_MODEL)
-VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
+VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "2048"))
+VULTR_USE_NORMALIZE = os.getenv("VULTR_USE_NORMALIZE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # ── Research API keys (all optional — missing keys = that source silently skipped)
 LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
-EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv(
     "ASKNEWS_SECRET", ""
 )
 
 LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
-EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
+
+_VULTR_SYSTEM_PROMPT = (
+    "You are a forecasting assistant. Put your analysis first, then end with the "
+    "exact final answer format requested (percentiles, probability, or dates) on the "
+    "last lines of your reply."
+)
+
+_PERCENTILE_ANSWER_RE = re.compile(
+    r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:,\d{3})*)"
+)
+
+
+def _vultr_inference_model_id(model: str) -> str:
+    if not VULTR_USE_NORMALIZE or model.endswith("-normalize"):
+        return model
+    return f"{model}-normalize"
+
+
+def _merge_assistant_message(message: Any) -> str:
+    if not isinstance(message, dict):
+        return _coerce_vultr_response_text(str(message))
+
+    parts: List[str] = []
+    for key in ("content", "reasoning", "reasoning_content", "text"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+
+    if parts:
+        return "\n\n".join(parts)
+
+    if "message" in message:
+        return _merge_assistant_message(message["message"])
+
+    return _coerce_vultr_response_text(json.dumps(message))
+
+
+def _coerce_vultr_response_text(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        return text
+
+    if text.startswith("{") and ("reasoning" in text or '"content"' in text):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
+        if isinstance(payload, dict):
+            if "choices" in payload and payload["choices"]:
+                return _merge_assistant_message(payload["choices"][0])
+            if any(key in payload for key in ("content", "reasoning", "role", "message")):
+                return _merge_assistant_message(payload)
+
+    return text
+
+
+def _has_percentile_answer(text: str) -> bool:
+    return len(_PERCENTILE_ANSWER_RE.findall(text)) >= 4
+
+
+def _has_binary_answer(text: str) -> bool:
+    return bool(re.search(r"(?:[Pp]robability|[Pp]rediction)\s*[:=]?\s*\d+\s*%", text)) or bool(
+        re.findall(r"\d+\s*%", text)
+    )
+
+
+async def _finalize_forecast_text(
+    llm: Union[GeneralLlm, VultrLlm],
+    analysis_text: str,
+    answer_kind: Literal["percentiles", "binary", "dates"],
+    question_hint: str,
+) -> str:
+    text = _coerce_vultr_response_text(analysis_text)
+
+    if answer_kind == "percentiles" and _has_percentile_answer(text):
+        return text
+    if answer_kind == "binary" and _has_binary_answer(text):
+        return text
+    if answer_kind == "dates" and re.search(
+        r"(?:[Pp]ercentile\s*)?(?:10|20|40|60|80|90)\s*[:=]\s*\d{4}-\d{2}-\d{2}", text
+    ):
+        return text
+
+    if answer_kind == "percentiles":
+        answer_format = (
+            "Percentile 10: XX\n"
+            "Percentile 20: XX\n"
+            "Percentile 40: XX\n"
+            "Percentile 60: XX\n"
+            "Percentile 80: XX\n"
+            "Percentile 90: XX"
+        )
+    elif answer_kind == "dates":
+        answer_format = (
+            "Percentile 10: YYYY-MM-DD\n"
+            "Percentile 20: YYYY-MM-DD\n"
+            "Percentile 40: YYYY-MM-DD\n"
+            "Percentile 60: YYYY-MM-DD\n"
+            "Percentile 80: YYYY-MM-DD\n"
+            "Percentile 90: YYYY-MM-DD"
+        )
+    else:
+        answer_format = "Probability: ZZ%"
+
+    follow_up = clean_indents(
+        f"""
+        You already analyzed this forecasting question. Output ONLY the final answer
+        block below with numeric values filled in. No analysis, headings, or JSON.
+
+        Question:
+        {question_hint}
+
+        Required final answer format:
+        {answer_format}
+
+        Prior analysis:
+        {text[:6000]}
+        """
+    )
+    finalized = _coerce_vultr_response_text(await llm.invoke(follow_up))
+    return finalized or text
 
 
 class VultrLlm(OutputsText, RetryableModel):
@@ -89,7 +216,8 @@ class VultrLlm(OutputsText, RetryableModel):
         api_url: Optional[str] = None,
     ) -> None:
         super().__init__(allowed_tries=max(1, allowed_tries))
-        self.model = model
+        self.model = _vultr_inference_model_id(model)
+        self.requested_model = model
         self.temperature = temperature
         self.timeout = timeout
         self.max_output_tokens = max_output_tokens
@@ -118,7 +246,10 @@ class VultrLlm(OutputsText, RetryableModel):
         }
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": _VULTR_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
             "temperature": self.temperature,
             "max_tokens": self.max_output_tokens,
         }
@@ -150,29 +281,34 @@ class VultrLlm(OutputsText, RetryableModel):
                 return value
             if isinstance(value, dict):
                 if "message" in value:
-                    extracted = _extract_text(value["message"])
-                    if extracted:
-                        return extracted
-                for key in ("output", "result", "text", "content"):
+                    merged = _merge_assistant_message(value["message"])
+                    if merged:
+                        return merged
+                merged = _merge_assistant_message(value)
+                if merged and not merged.startswith("{"):
+                    return merged
+                for key in ("output", "result", "text", "content", "reasoning", "reasoning_content"):
                     if key in value:
                         extracted = _extract_text(value[key])
                         if extracted:
                             return extracted
                 return json.dumps(value)
             if isinstance(value, list):
-                if value and isinstance(value[0], dict) and "message" in value[0]:
+                if value and isinstance(value[0], dict):
                     extracted = _extract_text(value[0])
                     if extracted:
                         return extracted
                 return " ".join(_extract_text(item) for item in value if item is not None)
             return str(value)
 
-        output = _extract_text(
-            data.get("choices")
-            or data.get("output")
-            or data.get("result")
-            or data.get("response")
-            or data.get("text")
+        output = _coerce_vultr_response_text(
+            _extract_text(
+                data.get("choices")
+                or data.get("output")
+                or data.get("result")
+                or data.get("response")
+                or data.get("text")
+            )
         )
         if not output:
             raise ValueError(
@@ -540,33 +676,6 @@ async def linkup_search(
         return []
 
 
-async def exa_search(
-    query: str,
-    max_results: int = 8,
-    max_age_hours: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """Query Exa. Returns [] silently if API key is missing or call fails."""
-    if not EXA_API_KEY:
-        return []
-    headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {
-        "query": query,
-        "numResults": max_results,
-        "type": "auto",
-        "useAutoprompt": True,
-        "contents": {"highlights": {"max_characters": 2000}},
-    }
-    if max_age_hours is not None:
-        payload["maxAgeHours"] = int(max_age_hours)
-    try:
-        async with httpx.AsyncClient() as client:
-            data = await _post_json_http(client, EXA_ENDPOINT, headers, payload)
-        return data.get("results", []) or []
-    except Exception as exc:
-        logger.warning("Exa search failed (query=%r): %s", query[:60], exc)
-        return []
-
-
 async def asknews_search(
     query: str,
     mode: str = "asknews/news-summaries",
@@ -863,7 +972,7 @@ async def _compress_reasoning(
         """
     )
     try:
-        compressed = await llm.invoke(prompt)
+        compressed = _coerce_vultr_response_text(await llm.invoke(prompt))
         lines = [l.strip() for l in compressed.strip().splitlines() if l.strip()]
         return " ".join(lines[:5])
     except Exception as exc:
@@ -880,36 +989,23 @@ async def _multi_source_research(
     summarizer_llm: GeneralLlm,
 ) -> str:
     """
-    Fan out to Exa, Linkup, and AskNews in parallel. Each source is optional —
+    Fan out to Linkup and AskNews in parallel. Each source is optional —
     missing API keys cause silent skips. All available results are merged,
-    ranked, and summarised. The final block clearly labels which sources
-    contributed so the downstream LLM knows how fresh the data is.
-
-    This is intentionally additive: callers can layer additional context on top.
+    ranked, and summarised.
     """
     q = question.question_text.strip()
     criteria = (question.resolution_criteria or "").strip()
     query_resolution = f"{q}\nResolution criteria:\n{criteria[:600]}"
-    query_criteria_only = criteria[:700] if criteria else q
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # ── Fan out all sources simultaneously ──────────────────────────────────
-    (
-        exa_1, exa_2, exa_3,
-        lk_1, lk_2,
-        asknews_result,
-    ) = await asyncio.gather(
-        exa_search(q, max_results=10),
-        exa_search(query_resolution, max_results=8),
-        exa_search(query_criteria_only, max_results=6),
+    lk_1, lk_2, asknews_result = await asyncio.gather(
         linkup_search(q, max_results=8, depth="deep"),
         linkup_search(query_resolution, max_results=6, depth="deep"),
         asknews_search(q, mode="asknews/news-summaries"),
         return_exceptions=True,
     )
 
-    # Normalise exceptions to empty
     def _safe_list(v: Any) -> List[Dict[str, Any]]:
         return v if isinstance(v, list) else []
 
@@ -917,17 +1013,12 @@ async def _multi_source_research(
         return v if isinstance(v, str) else ""
 
     structured_results: List[Dict[str, Any]] = [
-        *_safe_list(exa_1),
-        *_safe_list(exa_2),
-        *_safe_list(exa_3),
         *_safe_list(lk_1),
         *_safe_list(lk_2),
     ]
     asknews_text: str = _safe_str(asknews_result)
 
     sources_active: List[str] = []
-    if any(_safe_list(r) for r in (exa_1, exa_2, exa_3)):
-        sources_active.append("Exa")
     if any(_safe_list(r) for r in (lk_1, lk_2)):
         sources_active.append("Linkup")
     if asknews_text:
@@ -1026,18 +1117,12 @@ class NikeBot(ForecastBot):
     """
     Nike Bot — Evidence-first forecast mode.
 
-    Research strategy (all sources additive and optional via API keys):
-      • Exa         — semantic web search, high recall
+    Research strategy (optional via API keys):
       • Linkup      — deep web crawl with highlighted snippets
       • AskNews     — curated news summaries with freshness scores
-    All three run in parallel; missing keys are silently skipped so the bot
-    always runs even with zero third-party keys (falls back to LLM priors only,
-    which is the worst case and clearly flagged in the research block).
+    Both run in parallel; missing keys are silently skipped.
 
     Forecast model: Vultr serverless inference model by default.
-    Every forecast prompt includes the full research block so the model's
-    knowledge cutoff cannot silently contaminate the answer — the research
-    always carries a retrieval date.
     """
 
     _max_concurrent_questions: int = 1
@@ -1121,7 +1206,7 @@ class NikeBot(ForecastBot):
     # -------------------------------------------------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            # ── 1. Multi-source live research (Exa + Linkup + AskNews) ──────
+            # ── 1. Multi-source live research (Linkup + AskNews) ──────────────
             live_research = await _multi_source_research(
                 question,
                 self.get_llm("summarizer", "llm"),
@@ -1216,12 +1301,6 @@ class NikeBot(ForecastBot):
                 if researcher == "linkup":
                     return await self._linkup_research(question)
 
-                if researcher == "exa":
-                    return await self._exa_research(question)
-
-                if researcher == "linkup+exa":
-                    return await self._linkup_exa_research(question)
-
                 if researcher in ("", "None", "no_research"):
                     return ""
 
@@ -1268,99 +1347,6 @@ class NikeBot(ForecastBot):
             {summary}
 
             --- LINKUP SOURCES (ranked URLs) ---
-            {url_list}
-            """
-        ).strip()
-
-    async def _exa_research(self, question: MetaculusQuestion) -> str:
-        q = question.question_text.strip()
-        criteria = (question.resolution_criteria or "").strip()
-        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
-        query_criteria_only = criteria[:700] if criteria else q
-
-        exa_1, exa_2, exa_3 = await asyncio.gather(
-            exa_search(q, max_results=10),
-            exa_search(query_resolution, max_results=8),
-            exa_search(query_criteria_only, max_results=6),
-        )
-        combined: List[Dict[str, Any]] = [*(exa_1 or []), *(exa_2 or []), *(exa_3 or [])]
-        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
-
-        summarize_prompt = clean_indents(
-            f"""
-            You are a research assistant to a superforecaster.
-            Task: produce a concise, decision-relevant briefing grounded in the retrieved
-            sources. Do NOT produce a final forecast. Do NOT invent facts.
-
-            Question: {q}
-            Resolution criteria: {criteria}
-
-            Retrieved web snippets (ranked; each includes a URL):
-            {sources_block}
-
-            Output format:
-            1) Key facts (4-5 bullets max)
-            2) What would make this resolve YES vs NO (brief)
-            3) Timeline / what's likely before resolution (brief)
-            4) Source list (just the URLs, one per line)
-            """
-        )
-        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
-        url_list = "\n".join(urls[:20]) if urls else ""
-        return clean_indents(
-            f"""
-            {summary}
-
-            --- EXA SOURCES (ranked URLs) ---
-            {url_list}
-            """
-        ).strip()
-
-    async def _linkup_exa_research(self, question: MetaculusQuestion) -> str:
-        q = question.question_text.strip()
-        criteria = (question.resolution_criteria or "").strip()
-        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
-        query_criteria_only = criteria[:700] if criteria else q
-
-        linkup_1, linkup_2, exa_1, exa_2, exa_3 = await asyncio.gather(
-            linkup_search(q, max_results=8, depth="deep"),
-            linkup_search(query_resolution, max_results=6, depth="deep"),
-            exa_search(q, max_results=10),
-            exa_search(query_resolution, max_results=8),
-            exa_search(query_criteria_only, max_results=6),
-        )
-        combined: List[Dict[str, Any]] = [
-            *(linkup_1 or []), *(linkup_2 or []),
-            *(exa_1 or []), *(exa_2 or []), *(exa_3 or []),
-        ]
-        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=14)
-
-        summarize_prompt = clean_indents(
-            f"""
-            You are a research assistant to a superforecaster.
-            Task: produce a concise, decision-relevant briefing grounded in the retrieved
-            sources. Do NOT produce a final forecast. Do NOT invent facts.
-
-            Question: {q}
-            Resolution criteria: {criteria}
-
-            Retrieved web snippets (ranked; each includes a URL):
-            {sources_block}
-
-            Output format:
-            1) Key facts (6 bullets max)
-            2) What would make this resolve YES vs NO (brief)
-            3) Timeline / what's likely before resolution (brief)
-            4) Source list (just the URLs, one per line)
-            """
-        )
-        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
-        url_list = "\n".join(urls[:30]) if urls else ""
-        return clean_indents(
-            f"""
-            {summary}
-
-            --- SOURCES (ranked URLs) ---
             {url_list}
             """
         ).strip()
@@ -1427,6 +1413,12 @@ class NikeBot(ForecastBot):
         self, question: BinaryQuestion, prompt: str
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await _finalize_forecast_text(
+            self.get_llm("default", "llm"),
+            reasoning,
+            "binary",
+            question.question_text,
+        )
         logger.info("Reasoning for %s: %s", question.page_url, reasoning)
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
@@ -1681,6 +1673,12 @@ class NikeBot(ForecastBot):
         for attempt in range(max_retries):
             try:
                 reasoning = await self.get_llm("default", "llm").invoke(prompt)
+                reasoning = await _finalize_forecast_text(
+                    self.get_llm("default", "llm"),
+                    reasoning,
+                    "percentiles",
+                    question.question_text,
+                )
                 logger.info(
                     "Numeric reasoning for %s (attempt %d): %s",
                     question.page_url, attempt + 1, reasoning,
@@ -1879,6 +1877,12 @@ class NikeBot(ForecastBot):
         for attempt in range(max_retries):
             try:
                 reasoning = await self.get_llm("default", "llm").invoke(prompt)
+                reasoning = await _finalize_forecast_text(
+                    self.get_llm("default", "llm"),
+                    reasoning,
+                    "dates",
+                    question.question_text,
+                )
                 logger.info(
                     "Date reasoning for %s (attempt %d): %s",
                     question.page_url, attempt + 1, reasoning,
@@ -2179,8 +2183,6 @@ class NikeBot(ForecastBot):
 # ---------------------------------------------------------------------------
 def _log_startup_banner(mode: str, dry_run: bool) -> None:
     sources: List[str] = []
-    if EXA_API_KEY:
-        sources.append("Exa")
     if LINKUP_API_KEY:
         sources.append("Linkup")
     if ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET:
@@ -2351,7 +2353,7 @@ if __name__ == "__main__":
             # NikeBot already runs multi-source research; disable framework default.
             "researcher": "no_research",
             # ── Optional extra researcher ─────────────────────────────────────
-            # The multi-source engine (Exa + Linkup + AskNews) always runs first.
+            # The multi-source engine (Linkup + AskNews) always runs first.
             # Uncomment ONE of the lines below to add an extra research pass on
             # top of the base sources. Leave all commented out if not needed.
             #
