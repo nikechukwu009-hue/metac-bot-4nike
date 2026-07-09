@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import dotenv
 import httpx
+from pydantic import ValidationError
 
 from forecasting_tools.ai_models.model_interfaces.outputs_text import OutputsText
 from forecasting_tools.ai_models.model_interfaces.retryable_model import RetryableModel
@@ -91,6 +92,31 @@ _DATE_ANSWER_RE = re.compile(
     r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*(\d{4}-\d{2}-\d{2})"
 )
 _EXPECTED_PERCENTILE_LEVELS = (10, 20, 40, 60, 80, 90)
+_INSTRUCTION_ECHO_RE = re.compile(
+    r"(?:The user (?:wants|says)|Must (?:be|not|start)|"
+    r"No (?:bullet points|hedging|model names)|Do not (?:describe|use|start))",
+    re.IGNORECASE,
+)
+
+
+def _normalize_percentile_level(pct: float) -> float:
+    return pct / 100.0 if pct > 1 else pct
+
+
+def _strip_instruction_echo(text: str) -> str:
+    match = _INSTRUCTION_ECHO_RE.search(text)
+    if match:
+        text = text[: match.start()].rstrip(" .")
+    lines = [
+        line
+        for line in text.splitlines()
+        if not re.match(
+            r"^\s*(?:Must |No |Do not |Start with |Use first person|The user )",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+    return "\n".join(lines).strip()
 
 
 def _parse_numeric_token(value: str) -> float:
@@ -130,9 +156,7 @@ def _try_parse_percentile_json(text: str) -> Optional[List[Percentile]]:
             value_raw = item.get("value")
             if pct_raw is None or value_raw is None:
                 break
-            pct = float(pct_raw)
-            if pct > 1:
-                pct /= 100.0
+            pct = _normalize_percentile_level(float(pct_raw))
             parsed.append(Percentile(percentile=pct, value=_parse_numeric_token(str(value_raw))))
         if len(parsed) >= 4:
             return parsed
@@ -184,6 +208,37 @@ def _parse_date_percentiles_from_text(text: str) -> List[DatePercentile]:
     return parsed
 
 
+async def _parse_percentiles_with_llm(
+    text: str,
+    question: NumericQuestion,
+    parser_llm: Union[GeneralLlm, VultrLlm],
+) -> List[Percentile]:
+    parsing_prompt = clean_indents(
+        f"""
+        Convert the forecast text into a JSON array only.
+        Question: "{question.question_text}"
+        Units: {question.unit_of_measure}
+        Bounds: {question.lower_bound} – {question.upper_bound}
+
+        Use "percentile" as a decimal between 0 and 1 (0.1 = 10th, 0.9 = 90th).
+        Example:
+        [{{"percentile": 0.1, "value": -8}}, {{"percentile": 0.2, "value": -5}},
+         {{"percentile": 0.4, "value": 0}}, {{"percentile": 0.6, "value": 4}},
+         {{"percentile": 0.8, "value": 6}}, {{"percentile": 0.9, "value": 8}}]
+
+        Reply with the JSON array only. No other text.
+
+        Forecast text:
+        {_extract_percentile_lines(text)}
+        """
+    )
+    raw = _coerce_vultr_response_text(await parser_llm.invoke(parsing_prompt))
+    from_json = _try_parse_percentile_json(raw)
+    if from_json is not None:
+        return from_json
+    return _parse_percentiles_from_text(raw)
+
+
 async def _parse_percentiles_with_fallback(
     text: str,
     question: NumericQuestion,
@@ -195,23 +250,32 @@ async def _parse_percentiles_with_fallback(
     except ValueError:
         pass
 
+    try:
+        return await _parse_percentiles_with_llm(text, question, parser_llm)
+    except ValueError:
+        pass
+
     parsing_instructions = clean_indents(
         f"""
         The text is a forecast distribution for a numeric question.
         Question: "{question.question_text}"
         Units: {question.unit_of_measure}
         Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
-        Return ONLY a JSON array of objects with "percentile" (0-1) and "value" keys.
+        Return ONLY a JSON array of objects with "percentile" (0-1 decimal) and "value" keys.
         No prose before or after the JSON.
         """
     )
-    return await structure_output(
+    structured = await structure_output(
         _extract_percentile_lines(text),
         list[Percentile],
         model=parser_llm,
         additional_instructions=parsing_instructions,
         num_validation_samples=validation_samples,
     )
+    return [
+        Percentile(percentile=_normalize_percentile_level(p.percentile), value=p.value)
+        for p in structured
+    ]
 
 
 async def _parse_date_percentiles_with_fallback(
@@ -252,21 +316,51 @@ def _vultr_inference_model_id(model: str) -> str:
 
 def _merge_assistant_message(message: Any) -> str:
     if not isinstance(message, dict):
-        return _coerce_vultr_response_text(str(message))
+        return _strip_instruction_echo(_coerce_vultr_response_text(str(message)))
 
-    parts: List[str] = []
-    for key in ("content", "reasoning", "reasoning_content", "text"):
+    content = message.get("content")
+    content_str = content.strip() if isinstance(content, str) else ""
+
+    reasoning_parts: List[str] = []
+    for key in ("reasoning", "reasoning_content"):
         value = message.get(key)
         if isinstance(value, str) and value.strip():
-            parts.append(value.strip())
+            reasoning_parts.append(value.strip())
+    reasoning_str = "\n\n".join(reasoning_parts)
 
-    if parts:
-        return "\n\n".join(parts)
+    text_value = message.get("text")
+    text_str = text_value.strip() if isinstance(text_value, str) else ""
+
+    if content_str and (
+        _has_percentile_answer(content_str)
+        or _has_binary_answer(content_str)
+        or re.search(r"\d{4}-\d{2}-\d{2}", content_str)
+    ):
+        return _extract_percentile_lines(content_str)
+
+    if content_str and not reasoning_str:
+        return _strip_instruction_echo(content_str)
+
+    if reasoning_str and not content_str:
+        if _has_percentile_answer(reasoning_str):
+            return _extract_percentile_lines(reasoning_str)
+        return _strip_instruction_echo(reasoning_str)
+
+    if content_str and reasoning_str:
+        combined = f"{reasoning_str}\n\n{content_str}"
+        if _has_percentile_answer(combined):
+            return _extract_percentile_lines(combined)
+        if _has_binary_answer(content_str):
+            return content_str
+        return _strip_instruction_echo(content_str or reasoning_str)
+
+    if text_str:
+        return _strip_instruction_echo(text_str)
 
     if "message" in message:
         return _merge_assistant_message(message["message"])
 
-    return _coerce_vultr_response_text(json.dumps(message))
+    return _strip_instruction_echo(_coerce_vultr_response_text(json.dumps(message)))
 
 
 def _coerce_vultr_response_text(raw: str) -> str:
@@ -971,34 +1065,31 @@ async def _compress_reasoning(
     question_text: str,
     final_prediction_str: str,
 ) -> str:
+    source = _strip_instruction_echo(full_reasoning[:3000])
     prompt = clean_indents(
         f"""
-        You are editing a forecaster's reasoning note for a public comment.
+        Summarize this forecast in 2-3 first-person sentences for a Metaculus comment.
 
         Question: {question_text}
-        Final prediction: {final_prediction_str}
+        Prediction: {final_prediction_str}
+        Notes: {source}
 
-        Full reasoning:
-        {full_reasoning[:3000]}
+        Sentence 1: strongest supporting evidence.
+        Sentence 2: main remaining risk.
+        Sentence 3: conclusion and confidence.
 
-        Write exactly 2-3 sentences in first person that:
-        1. State the strongest evidence that supports the forecast.
-        2. Briefly name the main remaining risk.
-        3. State the conclusion and confidence clearly.
-
-        Rules:
-        - Use first person (I / I'm) and be direct.
-        - Do not describe the research process, tools, or strategy.
-        - No model names, no tool names, no "my research assistant says".
-        - No hedging phrases like "it's hard to say" or "I could be wrong".
-        - No bullet points, headers, or markdown.
-        - Start with evidence or the conclusion, not with "The question asks...".
+        Output only those sentences. No lists, headers, or meta-commentary.
         """
     )
     try:
-        compressed = _coerce_vultr_response_text(await llm.invoke(prompt))
+        compressed = _strip_instruction_echo(
+            _coerce_vultr_response_text(await llm.invoke(prompt))
+        )
         lines = [l.strip() for l in compressed.strip().splitlines() if l.strip()]
-        return " ".join(lines[:5])
+        summary = " ".join(lines[:3])
+        if summary and not summary.lower().startswith(("the user", "must ", "no ")):
+            return summary
+        return source[:300]
     except Exception as exc:
         logger.warning("Reasoning compression failed: %s", exc)
         return full_reasoning.strip()[:300]
@@ -1688,7 +1779,7 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except (AssertionError, ValueError) as exc:
+            except (AssertionError, ValueError, ValidationError) as exc:
                 last_error = exc
                 logger.warning(
                     "Numeric parse failed on attempt %d for %s: %s",
@@ -1878,7 +1969,7 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except (AssertionError, ValueError) as exc:
+            except (AssertionError, ValueError, ValidationError) as exc:
                 last_error = exc
                 logger.warning(
                     "Date parse failed on attempt %d for %s: %s",
