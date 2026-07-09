@@ -6,6 +6,7 @@ import datetime
 import json
 import os
 import re
+from typing import Optional
 
 import dotenv
 
@@ -15,7 +16,6 @@ import forecasting_tools
 import numpy as np
 import requests
 from asknews_sdk import AskNewsSDK
-from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, model_validator
 
 """
@@ -65,6 +65,10 @@ EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
+VULTR_API_KEY = os.getenv("VULTR_API_KEY", "")
+VULTR_API_URL = os.getenv("VULTR_API_URL", "https://api.vultr.com/v2/ai/inference")
+VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
+VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
 
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
@@ -255,27 +259,79 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3) -> str:
+async def call_llm(prompt: str, model: str = VULTR_DEFAULT_MODEL, temperature: float = 0.3) -> str:
     """
-    Makes a streaming completion request to OpenAI's API with concurrent request limiting.
+    Makes a request to Vultr's serverless inference API with concurrent request limiting.
     """
 
-    # Remove the base_url parameter to call the OpenAI API directly
-    # Also checkout the package 'litellm' for one function that can call any model from any provider
-    # Also checkout OpenRouter for allowing one API key for many providers (especially powerful if combined with litellm)
-    client = AsyncOpenAI()
+    if not VULTR_API_KEY:
+        raise ValueError("VULTR_API_KEY is required for Vultr serverless inference.")
+
+    headers = {
+        "Authorization": f"Bearer {VULTR_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "input": prompt,
+        "temperature": temperature,
+        "max_output_tokens": VULTR_MAX_OUTPUT_TOKENS,
+    }
 
     async with llm_rate_limiter:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            stream=False,
-        )
-        answer = response.choices[0].message.content
-        if answer is None:
-            raise ValueError("No answer returned from LLM")
-        return answer
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    VULTR_API_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=HTTP_TIMEOUT_S,
+                )
+                if response.status_code >= 500 and attempt + 1 < 3:
+                    last_error = RuntimeError(
+                        f"Vultr server error {response.status_code}: {response.text}"
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 >= 3:
+                    raise
+                await asyncio.sleep(1.0)
+        else:
+            raise last_error  # type: ignore
+
+    def _text_from_response(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("output", "result", "text", "content"):
+                if key in value:
+                    extracted = _text_from_response(value[key])
+                    if extracted:
+                        return extracted
+            return json.dumps(value)
+        if isinstance(value, list):
+            return " ".join(_text_from_response(item) for item in value)
+        return str(value)
+
+    answer = _text_from_response(
+        data.get("output")
+        or data.get("result")
+        or data.get("choices")
+        or data.get("response")
+        or data.get("text")
+    )
+    if not answer:
+        raise ValueError("No answer returned from Vultr inference")
+    return answer.strip()
 
 
 def run_research(question: str) -> str:

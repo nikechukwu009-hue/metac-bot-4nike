@@ -50,17 +50,16 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Free OpenRouter model — capable, no cost, always available.
-# Override via env to swap in any other free/paid model without code changes.
-OPENROUTER_DEFAULT_MODEL = os.getenv(
-    "OPENROUTER_DEFAULT_MODEL", "openrouter/free"
+# Vultr serverless inference config.
+# Override via env to swap in any other Vultr-compatible model without code changes.
+VULTR_API_KEY = os.getenv("VULTR_API_KEY", "")
+VULTR_API_URL = os.getenv(
+    "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
 )
-OPENROUTER_SUMMARIZER_MODEL = os.getenv(
-    "OPENROUTER_SUMMARIZER_MODEL", OPENROUTER_DEFAULT_MODEL
-)
-OPENROUTER_PARSER_MODEL = os.getenv(
-    "OPENROUTER_PARSER_MODEL", OPENROUTER_DEFAULT_MODEL
-)
+VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
+VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
+VULTR_PARSER_MODEL = os.getenv("VULTR_PARSER_MODEL", VULTR_DEFAULT_MODEL)
+VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
 
 # ── Research API keys (all optional — missing keys = that source silently skipped)
 LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
@@ -68,9 +67,97 @@ EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET", "")
 
+VULTR_API_KEY = os.getenv("VULTR_API_KEY", "")
+VULTR_API_URL = os.getenv(
+    "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
+)
+VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
+VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
+VULTR_PARSER_MODEL = os.getenv("VULTR_PARSER_MODEL", VULTR_DEFAULT_MODEL)
+VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
+
 LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
 EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
+
+
+class VultrLlm:
+    def __init__(
+        self,
+        model: str,
+        temperature: float = 0.2,
+        timeout: float = 60.0,
+        allowed_tries: int = 1,
+        max_output_tokens: int = VULTR_MAX_OUTPUT_TOKENS,
+        api_url: Optional[str] = None,
+    ) -> None:
+        self.model = model
+        self.temperature = temperature
+        self.timeout = timeout
+        self.allowed_tries = allowed_tries
+        self.max_output_tokens = max_output_tokens
+        self.api_url = api_url or VULTR_API_URL
+
+    async def invoke(self, prompt: str) -> str:
+        if not VULTR_API_KEY:
+            raise ValueError(
+                "VULTR_API_KEY is required for Vultr serverless inference."
+            )
+
+        headers = {
+            "Authorization": f"Bearer {VULTR_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": prompt,
+            "temperature": self.temperature,
+            "max_output_tokens": self.max_output_tokens,
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            last_exc: Optional[Exception] = None
+            for attempt in range(max(1, self.allowed_tries)):
+                try:
+                    response = await client.post(
+                        self.api_url,
+                        json=payload,
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt + 1 >= self.allowed_tries:
+                        raise
+                    await asyncio.sleep(1.0)
+            else:
+                raise last_exc  # type: ignore
+
+        def _extract_text(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                for key in ("output", "result", "text", "content"):
+                    if key in value:
+                        extracted = _extract_text(value[key])
+                        if extracted:
+                            return extracted
+                return json.dumps(value)
+            if isinstance(value, list):
+                return " ".join(_extract_text(item) for item in value if item is not None)
+            return str(value)
+
+        output = _extract_text(data.get("output") or data.get("result") or data.get("choices") or data.get("response") or data.get("text"))
+        if not output:
+            raise ValueError(
+                "Vultr inference response did not include usable text output."
+            )
+
+        return output.strip()
 
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
@@ -885,7 +972,7 @@ class NikeBot(ForecastBot):
     always runs even with zero third-party keys (falls back to LLM priors only,
     which is the worst case and clearly flagged in the research block).
 
-    Forecast model: free OpenRouter model (llama-4-maverick:free by default).
+    Forecast model: Vultr serverless inference model by default.
     Every forecast prompt includes the full research block so the model's
     knowledge cutoff cannot silently contaminate the answer — the research
     always carries a retrieval date.
@@ -2010,7 +2097,7 @@ def _log_startup_banner(mode: str, dry_run: bool) -> None:
     logger.info("=" * 60)
     logger.info("  Nike Bot  —  Just Forecast It.")
     logger.info("  Mode          : %s%s", mode, "  [DRY RUN]" if dry_run else "")
-    logger.info("  Default model : %s", OPENROUTER_DEFAULT_MODEL)
+    logger.info("  Default model : %s", VULTR_DEFAULT_MODEL)
     logger.info("  Live sources  : %s", sources_str)
     logger.info("  CalibScale    : %.2f (1.0 = no regression)", CALIBRATION_SCALE)
     logger.info("  ExtremizeScale: %.2f (>1.0 = push from 0.5)", EXTREMIZE_SCALE)
@@ -2144,25 +2231,28 @@ if __name__ == "__main__":
         dry_run=dry_run,
         llms={
             # ── Forecast & parse ─────────────────────────────────────────────
-            # Free OpenRouter model. Override OPENROUTER_DEFAULT_MODEL env var
-            # to swap in any other model (free or paid) without code changes.
-            "default": GeneralLlm(
-                model=OPENROUTER_DEFAULT_MODEL,
+            # Vultr serverless inference model. Override VULTR_DEFAULT_MODEL env var
+            # to swap in any other Vultr-compatible model without code changes.
+            "default": VultrLlm(
+                model=VULTR_DEFAULT_MODEL,
                 temperature=0.2,
                 timeout=60,
                 allowed_tries=2,
+                max_output_tokens=VULTR_MAX_OUTPUT_TOKENS,
             ),
-            "summarizer": GeneralLlm(
-                model=OPENROUTER_SUMMARIZER_MODEL,
+            "summarizer": VultrLlm(
+                model=VULTR_SUMMARIZER_MODEL,
                 temperature=0.2,
                 timeout=60,
                 allowed_tries=2,
+                max_output_tokens=VULTR_MAX_OUTPUT_TOKENS,
             ),
-            "parser": GeneralLlm(
-                model=OPENROUTER_PARSER_MODEL,
+            "parser": VultrLlm(
+                model=VULTR_PARSER_MODEL,
                 temperature=0.0,
                 timeout=60,
                 allowed_tries=2,
+                max_output_tokens=VULTR_MAX_OUTPUT_TOKENS,
             ),
             # ── Optional extra researcher ─────────────────────────────────────
             # The multi-source engine (Exa + Linkup + AskNews) always runs first.
