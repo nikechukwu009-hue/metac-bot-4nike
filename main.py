@@ -58,7 +58,7 @@ VULTR_API_KEY = os.getenv("VULTR_API_KEY") or os.getenv(
     "VULTR_SERVERLESS_INFERENCE_API_KEY", ""
 )
 VULTR_API_URL = os.getenv(
-    "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
+    "VULTR_API_URL", "https://api.vultrinference.com/v1/chat/completions"
 )
 VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
 VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
@@ -69,7 +69,9 @@ VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
 LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
 EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
-ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET", "")
+ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv(
+    "ASKNEWS_SECRET", ""
+)
 
 LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
 EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
@@ -116,9 +118,9 @@ class VultrLlm(OutputsText, RetryableModel):
         }
         payload = {
             "model": self.model,
-            "input": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
-            "max_output_tokens": self.max_output_tokens,
+            "max_tokens": self.max_output_tokens,
         }
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -147,6 +149,10 @@ class VultrLlm(OutputsText, RetryableModel):
             if isinstance(value, str):
                 return value
             if isinstance(value, dict):
+                if "message" in value:
+                    extracted = _extract_text(value["message"])
+                    if extracted:
+                        return extracted
                 for key in ("output", "result", "text", "content"):
                     if key in value:
                         extracted = _extract_text(value[key])
@@ -154,10 +160,20 @@ class VultrLlm(OutputsText, RetryableModel):
                             return extracted
                 return json.dumps(value)
             if isinstance(value, list):
+                if value and isinstance(value[0], dict) and "message" in value[0]:
+                    extracted = _extract_text(value[0])
+                    if extracted:
+                        return extracted
                 return " ".join(_extract_text(item) for item in value if item is not None)
             return str(value)
 
-        output = _extract_text(data.get("output") or data.get("result") or data.get("choices") or data.get("response") or data.get("text"))
+        output = _extract_text(
+            data.get("choices")
+            or data.get("output")
+            or data.get("result")
+            or data.get("response")
+            or data.get("text")
+        )
         if not output:
             raise ValueError(
                 "Vultr inference response did not include usable text output."
@@ -558,17 +574,57 @@ async def asknews_search(
     """
     Query AskNews. Returns '' silently if credentials are missing or call fails.
 
-    mode can be one of:
-      - "asknews/news-summaries"
-      - "asknews/deep-research/low-depth"
-      - "asknews/deep-research/medium-depth"
-      - "asknews/deep-research/high-depth"
+    Uses the AskNews SDK directly so we stay compatible with the installed
+    asknews package (forecasting-tools may pass unsupported kwargs like try_cache).
     """
+    if mode != "asknews/news-summaries":
+        logger.warning(
+            "AskNews mode %s is not supported by the direct SDK wrapper; skipping",
+            mode,
+        )
+        return ""
     if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
         return ""
     try:
-        result = await AskNewsSearcher().call_preconfigured_version(mode, query)
-        return result or ""
+        from asknews_sdk import AsyncAskNewsSDK
+
+        async with AsyncAskNewsSDK(
+            client_id=ASKNEWS_CLIENT_ID,
+            client_secret=ASKNEWS_CLIENT_SECRET,
+            scopes={"news"},
+        ) as ask:
+            hot_response = await ask.news.search_news(
+                query=query,
+                n_articles=6,
+                return_type="both",
+                strategy="latest news",
+            )
+            historical_response = await ask.news.search_news(
+                query=query,
+                n_articles=10,
+                return_type="both",
+                strategy="news knowledge",
+            )
+
+        parts: List[str] = ["Here are the relevant news articles:\n"]
+        for label, response in (
+            ("Latest news", hot_response),
+            ("Recent context", historical_response),
+        ):
+            articles = getattr(response, "as_dicts", None) or []
+            if not articles:
+                continue
+            parts.append(f"\n## {label}\n")
+            for article in sorted(articles, key=lambda a: a.pub_date, reverse=True):
+                pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
+                parts.append(
+                    f"**{article.eng_title}**\n{article.summary}\n"
+                    f"Publish date: {pub_date}\n"
+                    f"Source: [{article.source_id}]({article.article_url})\n"
+                )
+
+        formatted = "\n".join(parts).strip()
+        return formatted if formatted else ""
     except Exception as exc:
         logger.warning("AskNews search failed (mode=%s): %s", mode, exc)
         return ""
@@ -2261,6 +2317,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
+        enable_summarize_research=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,
@@ -2291,6 +2348,8 @@ if __name__ == "__main__":
                 allowed_tries=2,
                 max_output_tokens=VULTR_MAX_OUTPUT_TOKENS,
             ),
+            # NikeBot already runs multi-source research; disable framework default.
+            "researcher": "no_research",
             # ── Optional extra researcher ─────────────────────────────────────
             # The multi-source engine (Exa + Linkup + AskNews) always runs first.
             # Uncomment ONE of the lines below to add an extra research pass on
