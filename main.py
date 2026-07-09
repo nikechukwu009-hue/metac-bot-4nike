@@ -72,15 +72,11 @@ VULTR_USE_NORMALIZE = os.getenv("VULTR_USE_NORMALIZE", "true").lower() in (
     "yes",
 )
 
-# ── Research API keys (all optional — missing keys = that source silently skipped)
-LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
+# ── Research API keys (optional — missing keys = that source silently skipped)
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
 ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv(
     "ASKNEWS_SECRET", ""
 )
-
-LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
-HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
 _VULTR_SYSTEM_PROMPT = (
     "You are a forecasting assistant. Put your analysis first, then end with the "
@@ -352,8 +348,6 @@ SPRING_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("SPRING_EXTREMIZE_LOW_TH
 SPRING_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("SPRING_EXTREMIZE_LOW_FLOOR", "0.05"))
 
 RUN_LOG_PATH: str = os.getenv("RUN_LOG_PATH", "nike_bot_run_log.jsonl")
-
-_WS_RE = re.compile(r"\s+")
 
 # ---------------------------------------------------------------------------
 # Bound-coercion helpers
@@ -637,44 +631,6 @@ class PatchedMetaculusClient(MetaculusClient):
 # ---------------------------------------------------------------------------
 # Web-search helpers
 # ---------------------------------------------------------------------------
-async def _post_json_http(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: Dict[str, str],
-    payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    r = await client.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_S)
-    r.raise_for_status()
-    return r.json()
-
-
-async def linkup_search(
-    query: str, max_results: int = 8, depth: str = "deep"
-) -> List[Dict[str, Any]]:
-    """Query Linkup. Returns [] silently if API key is missing or call fails."""
-    if not LINKUP_API_KEY:
-        return []
-    headers = {
-        "Authorization": f"Bearer {LINKUP_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload: Dict[str, Any] = {
-        "q": query,
-        "depth": depth,
-        "outputType": "searchResults",
-        "includeSources": False,
-        "includeImages": False,
-        "includeInlineCitations": False,
-        "maxResults": max_results,
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            data = await _post_json_http(client, LINKUP_ENDPOINT, headers, payload)
-        return data.get("results", []) or []
-    except Exception as exc:
-        logger.warning("Linkup search failed (query=%r): %s", query[:60], exc)
-        return []
-
 
 async def asknews_search(
     query: str,
@@ -737,92 +693,6 @@ async def asknews_search(
     except Exception as exc:
         logger.warning("AskNews search failed (mode=%s): %s", mode, exc)
         return ""
-
-
-# ---------------------------------------------------------------------------
-# Source-ranking helpers
-# ---------------------------------------------------------------------------
-_HIGH_TRUST_DOMAINS = {
-    "reuters.com", "apnews.com", "ft.com", "wsj.com", "bloomberg.com",
-    "economist.com", "bbc.co.uk", "bbc.com", "theguardian.com", "nytimes.com",
-    "washingtonpost.com", "sec.gov", "federalregister.gov", "europa.eu",
-    "ec.europa.eu", "gov.uk", "who.int", "un.org", "worldbank.org", "imf.org",
-    "oecd.org", "arxiv.org", "nature.com", "science.org", "ieee.org", "acm.org",
-}
-_MED_TRUST_HINTS = (
-    "investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com"
-)
-_LOW_TRUST_HINTS = (
-    "pinterest.", "quora.", "medium.com", "substack.com", "blogspot.",
-    "wordpress.", "tumblr.", "tiktok.", "facebook.", "x.com", "twitter.com",
-)
-
-
-def _domain_of(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower()
-        return host[4:] if host.startswith("www.") else host
-    except Exception:
-        return ""
-
-
-def _score_source(url: str, title: str = "", snippet: str = "") -> float:
-    d = _domain_of(url)
-    if not d:
-        return 0.0
-    score = 0.0
-    if d in _HIGH_TRUST_DOMAINS:
-        score += 2.5
-    if d.endswith((".gov", ".edu", ".org")):
-        score += 1.7
-    if "github.com" in d:
-        score += 1.0
-    low = (title + " " + snippet).lower()
-    if any(h in d for h in _MED_TRUST_HINTS) or any(h in low for h in _MED_TRUST_HINTS):
-        score += 0.6
-    if any(h in d for h in _LOW_TRUST_HINTS):
-        score -= 1.0
-    if len(snippet.strip()) < 120:
-        score -= 0.2
-    return score
-
-
-def _rank_and_format_sources(
-    items: List[Dict[str, Any]], max_to_keep: int = 14
-) -> tuple[str, List[str]]:
-    scored: List[tuple[float, str, str, str]] = []
-    for it in items:
-        url = (it.get("url") or "").strip()
-        if not url:
-            continue
-        title = (it.get("title") or it.get("name") or "").strip()
-        text = ""
-        if isinstance(it.get("highlights"), list) and it["highlights"]:
-            text = str(it["highlights"][0])
-        else:
-            text = (it.get("content") or it.get("text") or "").strip()
-        snippet = _WS_RE.sub(" ", text)[:420]
-        scored.append(
-            (_score_source(url, title=title, snippet=snippet), url, title, snippet)
-        )
-
-    best_by_url: Dict[str, tuple[float, str, str]] = {}
-    for score, url, title, snippet in scored:
-        cur = best_by_url.get(url)
-        if cur is None or score > cur[0]:
-            best_by_url[url] = (score, title, snippet)
-
-    ranked = sorted(
-        ((s, u, t, sn) for u, (s, t, sn) in best_by_url.items()), reverse=True
-    )
-    bullets: List[str] = []
-    urls: List[str] = []
-    for score, url, title, snippet in ranked[:max_to_keep]:
-        label = title if title else url
-        bullets.append(f"- [{score:+.2f}] {label}: {snippet} ({url})")
-        urls.append(url)
-    return ("\n".join(bullets) if bullets else "(no sources retrieved)"), urls
 
 
 # ---------------------------------------------------------------------------
@@ -989,38 +859,18 @@ async def _multi_source_research(
     summarizer_llm: GeneralLlm,
 ) -> str:
     """
-    Fan out to Linkup and AskNews in parallel. Each source is optional —
-    missing API keys cause silent skips. All available results are merged,
-    ranked, and summarised.
+    Fetch AskNews summaries for the question. Returns a synthesised briefing
+    from AskNews when credentials are configured; otherwise falls back to LLM priors.
     """
     q = question.question_text.strip()
     criteria = (question.resolution_criteria or "").strip()
-    query_resolution = f"{q}\nResolution criteria:\n{criteria[:600]}"
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    lk_1, lk_2, asknews_result = await asyncio.gather(
-        linkup_search(q, max_results=8, depth="deep"),
-        linkup_search(query_resolution, max_results=6, depth="deep"),
-        asknews_search(q, mode="asknews/news-summaries"),
-        return_exceptions=True,
-    )
-
-    def _safe_list(v: Any) -> List[Dict[str, Any]]:
-        return v if isinstance(v, list) else []
-
-    def _safe_str(v: Any) -> str:
-        return v if isinstance(v, str) else ""
-
-    structured_results: List[Dict[str, Any]] = [
-        *_safe_list(lk_1),
-        *_safe_list(lk_2),
-    ]
-    asknews_text: str = _safe_str(asknews_result)
+    asknews_result = await asknews_search(q, mode="asknews/news-summaries")
+    asknews_text: str = asknews_result if isinstance(asknews_result, str) else ""
 
     sources_active: List[str] = []
-    if any(_safe_list(r) for r in (lk_1, lk_2)):
-        sources_active.append("Linkup")
     if asknews_text:
         sources_active.append("AskNews")
 
@@ -1028,15 +878,10 @@ async def _multi_source_research(
         ", ".join(sources_active) if sources_active else "none (no API keys configured)"
     )
     logger.info(
-        "Multi-source research for %s — active sources: %s",
+        "Research for %s — active sources: %s",
         question.page_url, sources_label,
     )
 
-    # ── Rank and format structured snippets ─────────────────────────────────
-    sources_block, urls = _rank_and_format_sources(structured_results, max_to_keep=14)
-    url_list = "\n".join(urls[:30]) if urls else "(none)"
-
-    # ── Build AskNews section ────────────────────────────────────────────────
     asknews_section = ""
     if asknews_text:
         asknews_section = clean_indents(
@@ -1046,56 +891,59 @@ async def _multi_source_research(
             """
         )
 
-    # ── Synthesise with summariser LLM ──────────────────────────────────────
-    synthesise_prompt = clean_indents(
-        f"""
-        You are a research assistant to a professional superforecaster.
-        Today's date: {today}.
+    if asknews_text:
+        synthesise_prompt = clean_indents(
+            f"""
+            You are a research assistant to a professional superforecaster.
+            Today's date: {today}.
 
-        Your job: produce a concise, decision-relevant briefing that helps the
-        forecaster make a well-calibrated probability estimate. Do NOT produce
-        a final forecast yourself. Do NOT invent facts. Only state what the
-        retrieved evidence says.
+            Your job: produce a concise, decision-relevant briefing that helps the
+            forecaster make a well-calibrated probability estimate. Do NOT produce
+            a final forecast yourself. Do NOT invent facts. Only state what the
+            retrieved evidence says.
 
-        Question:
-        {q}
+            Question:
+            {q}
 
-        Resolution criteria:
-        {criteria}
+            Resolution criteria:
+            {criteria}
 
-        === STRUCTURED WEB SNIPPETS (ranked by source credibility) ===
-        {sources_block}
+            {asknews_section}
 
-        {asknews_section}
+            Output format (use these exact headers):
+            ## Key facts
+            (4-6 bullets of the most decision-relevant facts from the sources above)
 
-        Output format (use these exact headers):
-        ## Key facts
-        (4-6 bullets of the most decision-relevant facts from the sources above)
+            ## YES scenario
+            (What evidence / conditions would lead to a YES resolution)
 
-        ## YES scenario
-        (What evidence / conditions would lead to a YES resolution)
+            ## NO scenario
+            (What evidence / conditions would lead to a NO resolution)
 
-        ## NO scenario
-        (What evidence / conditions would lead to a NO resolution)
+            ## Timeline signal
+            (Most important near-term event or data point that would shift the answer)
 
-        ## Timeline signal
-        (Most important near-term event or data point that would shift the answer)
+            ## Recency note
+            (State the date range of the evidence you found and flag any gaps)
+            """
+        )
+        try:
+            summary = await summarizer_llm.invoke(synthesise_prompt)
+        except Exception as exc:
+            logger.warning("Synthesis LLM failed for %s: %s", question.page_url, exc)
+            summary = f"(Synthesis failed: {exc})\n\n{asknews_section}"
+    else:
+        summary = clean_indents(
+            f"""
+            No live research sources were available for this question.
+            The forecaster should rely on question background and resolution criteria only.
 
-        ## Recency note
-        (State the date range of the evidence you found and flag any gaps)
+            Question:
+            {q}
 
-        ## Sources
-        {url_list}
-        """
-    )
-
-    try:
-        summary = await summarizer_llm.invoke(synthesise_prompt)
-    except Exception as exc:
-        logger.warning("Synthesis LLM failed for %s: %s", question.page_url, exc)
-        summary = (
-            f"(Synthesis failed: {exc})\n\n"
-            f"Raw snippets:\n{sources_block}\n\n{asknews_section}"
+            Resolution criteria:
+            {criteria}
+            """
         )
 
     return clean_indents(
@@ -1118,9 +966,7 @@ class NikeBot(ForecastBot):
     Nike Bot — Evidence-first forecast mode.
 
     Research strategy (optional via API keys):
-      • Linkup      — deep web crawl with highlighted snippets
       • AskNews     — curated news summaries with freshness scores
-    Both run in parallel; missing keys are silently skipped.
 
     Forecast model: Vultr serverless inference model by default.
     """
@@ -1206,7 +1052,7 @@ class NikeBot(ForecastBot):
     # -------------------------------------------------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            # ── 1. Multi-source live research (Linkup + AskNews) ──────────────
+            # ── 1. AskNews research ───────────────────────────────────────────
             live_research = await _multi_source_research(
                 question,
                 self.get_llm("summarizer", "llm"),
@@ -1298,9 +1144,6 @@ class NikeBot(ForecastBot):
                     )
                     return await searcher.invoke(prompt)
 
-                if researcher == "linkup":
-                    return await self._linkup_research(question)
-
                 if researcher in ("", "None", "no_research"):
                     return ""
 
@@ -1308,48 +1151,6 @@ class NikeBot(ForecastBot):
             logger.warning("Extra researcher failed for %s: %s", question.page_url, exc)
 
         return ""
-
-    async def _linkup_research(self, question: MetaculusQuestion) -> str:
-        q = question.question_text.strip()
-        criteria = (question.resolution_criteria or "").strip()
-        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
-
-        linkup_1, linkup_2 = await asyncio.gather(
-            linkup_search(q, max_results=8, depth="deep"),
-            linkup_search(query_resolution, max_results=6, depth="deep"),
-        )
-        combined: List[Dict[str, Any]] = [*(linkup_1 or []), *(linkup_2 or [])]
-        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
-
-        summarize_prompt = clean_indents(
-            f"""
-            You are a research assistant to a superforecaster.
-            Task: produce a concise, decision-relevant briefing grounded in the retrieved
-            sources. Do NOT produce a final forecast. Do NOT invent facts.
-
-            Question: {q}
-            Resolution criteria: {criteria}
-
-            Retrieved web snippets (ranked; each includes a URL):
-            {sources_block}
-
-            Output format:
-            1) Key facts (4-5 bullets max)
-            2) What would make this resolve YES vs NO (brief)
-            3) Timeline / what's likely before resolution (brief)
-            4) Source list (just the URLs, one per line)
-            """
-        )
-        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
-        url_list = "\n".join(urls[:20]) if urls else ""
-        return clean_indents(
-            f"""
-            {summary}
-
-            --- LINKUP SOURCES (ranked URLs) ---
-            {url_list}
-            """
-        ).strip()
 
     # -------------------------------------------------------------------------
     # Binary questions
@@ -2183,8 +1984,6 @@ class NikeBot(ForecastBot):
 # ---------------------------------------------------------------------------
 def _log_startup_banner(mode: str, dry_run: bool) -> None:
     sources: List[str] = []
-    if LINKUP_API_KEY:
-        sources.append("Linkup")
     if ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET:
         sources.append("AskNews")
     sources_str = ", ".join(sources) if sources else "none (LLM priors only)"
@@ -2353,13 +2152,11 @@ if __name__ == "__main__":
             # NikeBot already runs multi-source research; disable framework default.
             "researcher": "no_research",
             # ── Optional extra researcher ─────────────────────────────────────
-            # The multi-source engine (Linkup + AskNews) always runs first.
+            # The AskNews research pipeline always runs first.
             # Uncomment ONE of the lines below to add an extra research pass on
             # top of the base sources. Leave all commented out if not needed.
             #
             # "researcher": "asknews/deep-research/medium-depth",
-            # "researcher": "smart-searcher/openrouter/meta-llama/llama-4-maverick:free",
-            # "researcher": "linkup+exa",
         },
     )
 
