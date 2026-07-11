@@ -65,12 +65,11 @@ EXA_API_KEY = os.getenv("EXA_API_KEY")
 OPENAI_API_KEY = os.getenv(
     "OPENAI_API_KEY"
 )  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
-VULTR_API_KEY = os.getenv("VULTR_API_KEY") or os.getenv(
-    "VULTR_SERVERLESS_INFERENCE_API_KEY", ""
+VULTR_API_KEY = os.getenv(
+    "VULTR_SERVERLESS_INFERENCE_API_KEY",
+    os.getenv("VULTR_API_KEY", ""),
 )
-VULTR_API_URL = os.getenv(
-    "VULTR_API_URL", "https://api.vultrinference.com/v1/chat/completions"
-)
+VULTR_API_URL = os.getenv("VULTR_API_URL", "https://api.vultr.com/v2/ai/inference")
 VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
 VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
 
@@ -269,7 +268,9 @@ async def call_llm(prompt: str, model: str = VULTR_DEFAULT_MODEL, temperature: f
     """
 
     if not VULTR_API_KEY:
-        raise ValueError("VULTR_API_KEY is required for Vultr serverless inference.")
+        raise ValueError(
+            "VULTR_SERVERLESS_INFERENCE_API_KEY is required for Vultr serverless inference."
+        )
 
     headers = {
         "Authorization": f"Bearer {VULTR_API_KEY}",
@@ -277,9 +278,9 @@ async def call_llm(prompt: str, model: str = VULTR_DEFAULT_MODEL, temperature: f
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "input": prompt,
         "temperature": temperature,
-        "max_tokens": VULTR_MAX_OUTPUT_TOKENS,
+        "max_output_tokens": VULTR_MAX_OUTPUT_TOKENS,
     }
 
     async with llm_rate_limiter:
@@ -316,10 +317,6 @@ async def call_llm(prompt: str, model: str = VULTR_DEFAULT_MODEL, temperature: f
         if isinstance(value, str):
             return value
         if isinstance(value, dict):
-            if "message" in value:
-                extracted = _text_from_response(value["message"])
-                if extracted:
-                    return extracted
             for key in ("output", "result", "text", "content"):
                 if key in value:
                     extracted = _text_from_response(value[key])
@@ -327,10 +324,6 @@ async def call_llm(prompt: str, model: str = VULTR_DEFAULT_MODEL, temperature: f
                         return extracted
             return json.dumps(value)
         if isinstance(value, list):
-            if value and isinstance(value[0], dict) and "message" in value[0]:
-                extracted = _text_from_response(value[0])
-                if extracted:
-                    return extracted
             return " ".join(_text_from_response(item) for item in value)
         return str(value)
 

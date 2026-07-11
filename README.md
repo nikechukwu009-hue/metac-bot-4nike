@@ -19,9 +19,9 @@ If you run into trouble, reach out to `ben [at] metaculus [.com]`
 The easiest way to use this repo is to fork it, enable github workflow/actions, and then set repository secrets. Then your bot will run every 30min, pick up new questions, and forecast on them. Automation is handled in the `.github/workflows/` folder. The `daily_run_simple_bot.yaml` file runs the simple bot every 30min and will skip questions it has already forecasted on.
 
 1) **Fork the repository**: Go to the [repository](https://github.com/Metaculus/metac-bot-template) and click 'fork'.
-2) **Set secrets**: Go to `Settings -> Secrets and variables -> Actions -> New repository secret` and set API keys/Tokens as secrets. You will want to set your METACULUS_TOKEN and a `VULTR_API_KEY`. This will be used to post questions to Metaculus. Make sure to copy the name of these variables exactly (including all caps).
+2) **Set secrets**: Go to `Settings -> Secrets and variables -> Actions -> New repository secret` and set API keys/Tokens as secrets. You will want to set your METACULUS_TOKEN and a `VULTR_SERVERLESS_INFERENCE_API_KEY`. This will be used to post questions to Metaculus. Make sure to copy the name of these variables exactly (including all caps).
    - You can create a METACULUS_TOKEN at https://metaculus.com/aib. If you get confused, please see the instructions on our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#creating-your-bot-account-and-metaculus-token) page.
-   - You can get a `VULTR_API_KEY` from your Vultr account. If you need a different model, override `VULTR_DEFAULT_MODEL` or set `VULTR_SUMMARIZER_MODEL` / `VULTR_PARSER_MODEL` instead.
+   - You can get a `VULTR_SERVERLESS_INFERENCE_API_KEY` from your Vultr account. If you need a different model, override `VULTR_DEFAULT_MODEL` or set `VULTR_SUMMARIZER_MODEL` / `VULTR_PARSER_MODEL` instead.
    - Other LLM and Search providers should work out of the box for research (such as OPENAI_API_KEY, PERPLEXITY_API_KEY, ASKNEWS_SECRET, etc), but model inference is now routed through Vultr.
    - The bot is currently configured to forecast on AI tournament ID `33022`.
 4) **Enable Actions**: Go to 'Actions' then click 'Enable'. Then go to the 'Regularly forecast new questions' workflow, and click 'Enable'. To test if the workflow is working, click 'Run workflow', choose the main branch, then click the green 'Run workflow' button. This will check for new questions and forecast only on ones it has not yet successfully forecast on.
@@ -29,7 +29,7 @@ The easiest way to use this repo is to fork it, enable github workflow/actions, 
 The bot should just work as is at this point. You can disable the workflow by clicking `Actions > Regularly forecast new questions > Triple dots > disable workflow`
 
 ## API Keys
-Instructions for getting your METACULUS_TOKEN, VULTR_API_KEY, or optional search provider API keys (AskNews, Exa, Perplexity, etc) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
+Instructions for getting your METACULUS_TOKEN, VULTR_SERVERLESS_INFERENCE_API_KEY, or optional search provider API keys (AskNews, Exa, Perplexity, etc) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
 
 ## Changing the Github automation
 You can change which file is run in the GitHub automation by either changing the content of `main.py` to the contents of `main_with_no_framwork.py` (or another script) or by chaging all references to `main.py` to another script in `.github/workflows/run_bot_on_tournament.yaml` and related files.

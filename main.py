@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import asyncio
 import inspect
@@ -17,10 +15,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import dotenv
 import httpx
-from pydantic import ValidationError
 
-from forecasting_tools.ai_models.model_interfaces.outputs_text import OutputsText
-from forecasting_tools.ai_models.model_interfaces.retryable_model import RetryableModel
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -57,426 +52,30 @@ __all__ = ["NikeBot", "PatchedMetaculusClient"]
 
 # Vultr serverless inference config.
 # Override via env to swap in any other Vultr-compatible model without code changes.
-VULTR_API_KEY = os.getenv("VULTR_API_KEY") or os.getenv(
-    "VULTR_SERVERLESS_INFERENCE_API_KEY", ""
+VULTR_API_KEY = os.getenv(
+    "VULTR_SERVERLESS_INFERENCE_API_KEY",
+    os.getenv("VULTR_API_KEY", ""),
 )
 VULTR_API_URL = os.getenv(
-    "VULTR_API_URL", "https://api.vultrinference.com/v1/chat/completions"
+    "VULTR_API_URL", "https://api.vultr.com/v2/ai/inference"
 )
 VULTR_DEFAULT_MODEL = os.getenv("VULTR_DEFAULT_MODEL", "buoyant-3.5")
 VULTR_SUMMARIZER_MODEL = os.getenv("VULTR_SUMMARIZER_MODEL", VULTR_DEFAULT_MODEL)
 VULTR_PARSER_MODEL = os.getenv("VULTR_PARSER_MODEL", VULTR_DEFAULT_MODEL)
-VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "2048"))
-VULTR_USE_NORMALIZE = os.getenv("VULTR_USE_NORMALIZE", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+VULTR_MAX_OUTPUT_TOKENS = int(os.getenv("VULTR_MAX_OUTPUT_TOKENS", "1024"))
 
-# ── Research API keys (optional — missing keys = that source silently skipped)
+# ── Research API keys (all optional — missing keys = that source silently skipped)
+LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID", "")
-ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv(
-    "ASKNEWS_SECRET", ""
-)
+ASKNEWS_CLIENT_SECRET = os.getenv("ASKNEWS_CLIENT_SECRET", "")
 
-_VULTR_SYSTEM_PROMPT = (
-    "You are a forecasting assistant. Put your analysis first, then end with the "
-    "exact final answer format requested (percentiles, probability, or dates) on the "
-    "last lines of your reply."
-)
+LINKUP_ENDPOINT = os.getenv("LINKUP_ENDPOINT", "https://api.linkup.so/v1/search")
+EXA_ENDPOINT = os.getenv("EXA_ENDPOINT", "https://api.exa.ai/search")
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
-_PERCENTILE_ANSWER_RE = re.compile(
-    r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:,\d{3})*)"
-)
-_DATE_ANSWER_RE = re.compile(
-    r"(?:[Pp]ercentile\s*)?(10|20|40|60|80|90)\s*[:=]\s*(\d{4}-\d{2}-\d{2})"
-)
-_EXPECTED_PERCENTILE_LEVELS = (10, 20, 40, 60, 80, 90)
-_INSTRUCTION_ECHO_RE = re.compile(
-    r"(?:The user (?:wants|says)|Must (?:be|not|start)|"
-    r"No (?:bullet points|hedging|model names)|Do not (?:describe|use|start))",
-    re.IGNORECASE,
-)
 
-
-def _normalize_percentile_level(pct: float) -> float:
-    return pct / 100.0 if pct > 1 else pct
-
-
-def _strip_instruction_echo(text: str) -> str:
-    match = _INSTRUCTION_ECHO_RE.search(text)
-    if match:
-        text = text[: match.start()].rstrip(" .")
-    lines = [
-        line
-        for line in text.splitlines()
-        if not re.match(
-            r"^\s*(?:Must |No |Do not |Start with |Use first person|The user )",
-            line,
-            re.IGNORECASE,
-        )
-    ]
-    return "\n".join(lines).strip()
-
-
-def _strip_meta_before_percentiles(text: str) -> str:
-    if not _has_percentile_answer(text) and not _DATE_ANSWER_RE.search(text):
-        return text
-    match = re.search(
-        r"(?:^|\n)\s*(?:[Pp]ercentile\s*)?10\s*[:=]",
-        text,
-    )
-    if match:
-        return text[match.start() :].strip()
-    return text
-
-
-def _parse_numeric_token(value: str) -> float:
-    return float(value.replace(",", "").strip())
-
-
-def _extract_percentile_lines(text: str) -> str:
-    text = _strip_meta_before_percentiles(text)
-    last_by_level: Dict[int, str] = {}
-    for line in text.splitlines():
-        numeric_match = _PERCENTILE_ANSWER_RE.search(line)
-        if numeric_match:
-            last_by_level[int(numeric_match.group(1))] = line.strip()
-            continue
-        date_match = _DATE_ANSWER_RE.search(line)
-        if date_match:
-            last_by_level[int(date_match.group(1))] = line.strip()
-
-    if len(last_by_level) >= 4:
-        return "\n".join(
-            last_by_level[level]
-            for level in _EXPECTED_PERCENTILE_LEVELS
-            if level in last_by_level
-        )
-
-    lines: List[str] = []
-    for line in text.splitlines():
-        if _PERCENTILE_ANSWER_RE.search(line) or _DATE_ANSWER_RE.search(line):
-            lines.append(line.strip())
-    if len(lines) >= 4:
-        return "\n".join(lines)
-    return text
-
-
-def _try_parse_percentile_json(text: str) -> Optional[List[Percentile]]:
-    start = text.find("[")
-    if start == -1:
-        return None
-
-    for end in range(len(text), start + 1, -1):
-        if text[end - 1] != "]":
-            continue
-        try:
-            data = json.loads(text[start:end])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, list) or len(data) < 4:
-            continue
-
-        parsed: List[Percentile] = []
-        for item in data:
-            if not isinstance(item, dict):
-                break
-            pct_raw = item.get("percentile")
-            value_raw = item.get("value")
-            if pct_raw is None or value_raw is None:
-                break
-            pct = _normalize_percentile_level(float(pct_raw))
-            parsed.append(Percentile(percentile=pct, value=_parse_numeric_token(str(value_raw))))
-        if len(parsed) >= 4:
-            return parsed
-    return None
-
-
-def _parse_percentiles_from_text(text: str) -> List[Percentile]:
-    text = _extract_percentile_lines(_coerce_vultr_response_text(text))
-
-    from_json = _try_parse_percentile_json(text)
-    if from_json is not None:
-        return from_json
-
-    matches = _PERCENTILE_ANSWER_RE.findall(text)
-    if len(matches) < 4:
-        raise ValueError("Could not find enough percentile lines in forecast text")
-
-    pct_map: Dict[int, float] = {}
-    for pct_str, value_str in matches:
-        pct_map[int(pct_str)] = _parse_numeric_token(value_str)
-
-    parsed = [
-        Percentile(percentile=pct / 100.0, value=pct_map[pct])
-        for pct in _EXPECTED_PERCENTILE_LEVELS
-        if pct in pct_map
-    ]
-    if len(parsed) < 4:
-        raise ValueError("Incomplete percentile set in forecast text")
-    return parsed
-
-
-def _parse_date_percentiles_from_text(text: str) -> List[DatePercentile]:
-    text = _extract_percentile_lines(_coerce_vultr_response_text(text))
-    matches = _DATE_ANSWER_RE.findall(text)
-    if len(matches) < 4:
-        raise ValueError("Could not find enough date percentile lines in forecast text")
-
-    pct_map: Dict[int, datetime] = {}
-    for pct_str, date_str in matches:
-        pct_map[int(pct_str)] = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-
-    parsed = [
-        DatePercentile(percentile=pct / 100.0, value=pct_map[pct])
-        for pct in _EXPECTED_PERCENTILE_LEVELS
-        if pct in pct_map
-    ]
-    if len(parsed) < 4:
-        raise ValueError("Incomplete date percentile set in forecast text")
-    return parsed
-
-
-async def _parse_percentiles_with_llm(
-    text: str,
-    question: NumericQuestion,
-    parser_llm: Union[GeneralLlm, VultrLlm],
-) -> List[Percentile]:
-    parsing_prompt = clean_indents(
-        f"""
-        Convert the forecast text into a JSON array only.
-        Question: "{question.question_text}"
-        Units: {question.unit_of_measure}
-        Bounds: {question.lower_bound} – {question.upper_bound}
-
-        Use "percentile" as a decimal between 0 and 1 (0.1 = 10th, 0.9 = 90th).
-        Example:
-        [{{"percentile": 0.1, "value": -8}}, {{"percentile": 0.2, "value": -5}},
-         {{"percentile": 0.4, "value": 0}}, {{"percentile": 0.6, "value": 4}},
-         {{"percentile": 0.8, "value": 6}}, {{"percentile": 0.9, "value": 8}}]
-
-        Reply with the JSON array only. No other text.
-
-        Forecast text:
-        {_extract_percentile_lines(text)}
-        """
-    )
-    raw = _coerce_vultr_response_text(await parser_llm.invoke(parsing_prompt))
-    from_json = _try_parse_percentile_json(raw)
-    if from_json is not None:
-        return from_json
-    return _parse_percentiles_from_text(raw)
-
-
-async def _parse_percentiles_with_fallback(
-    text: str,
-    question: NumericQuestion,
-    parser_llm: Union[GeneralLlm, VultrLlm],
-    validation_samples: int,
-) -> List[Percentile]:
-    try:
-        return _parse_percentiles_from_text(text)
-    except ValueError:
-        pass
-
-    try:
-        return await _parse_percentiles_with_llm(text, question, parser_llm)
-    except ValueError:
-        pass
-
-    parsing_instructions = clean_indents(
-        f"""
-        The text is a forecast distribution for a numeric question.
-        Question: "{question.question_text}"
-        Units: {question.unit_of_measure}
-        Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
-        Return ONLY a JSON array of objects with "percentile" (0-1 decimal) and "value" keys.
-        No prose before or after the JSON.
-        """
-    )
-    structured = await structure_output(
-        _extract_percentile_lines(text),
-        list[Percentile],
-        model=parser_llm,
-        additional_instructions=parsing_instructions,
-        num_validation_samples=validation_samples,
-    )
-    return [
-        Percentile(percentile=_normalize_percentile_level(p.percentile), value=p.value)
-        for p in structured
-    ]
-
-
-async def _parse_date_percentiles_with_fallback(
-    text: str,
-    question: DateQuestion,
-    parser_llm: Union[GeneralLlm, VultrLlm],
-    validation_samples: int,
-) -> List[DatePercentile]:
-    try:
-        return _parse_date_percentiles_from_text(text)
-    except ValueError:
-        pass
-
-    parsing_instructions = clean_indents(
-        f"""
-        The text is a forecast distribution for a date question.
-        Question: "{question.question_text}"
-        Bounds: {question.lower_bound.date().isoformat()} to
-                {question.upper_bound.date().isoformat()}
-        Return ONLY a JSON array of objects with "percentile" (0-1) and "value" keys.
-        No prose before or after the JSON.
-        """
-    )
-    return await structure_output(
-        _extract_percentile_lines(text),
-        list[DatePercentile],
-        model=parser_llm,
-        additional_instructions=parsing_instructions,
-        num_validation_samples=validation_samples,
-    )
-
-
-def _vultr_inference_model_id(model: str) -> str:
-    if not VULTR_USE_NORMALIZE or model.endswith("-normalize"):
-        return model
-    return f"{model}-normalize"
-
-
-def _merge_assistant_message(message: Any) -> str:
-    if not isinstance(message, dict):
-        return _coerce_vultr_response_text(str(message))
-
-    if "message" in message and isinstance(message["message"], dict):
-        nested = _merge_assistant_message(message["message"])
-        if nested:
-            return nested
-
-    content = message.get("content")
-    content_str = content.strip() if isinstance(content, str) else ""
-
-    reasoning_parts: List[str] = []
-    for key in ("reasoning", "reasoning_content"):
-        value = message.get(key)
-        if isinstance(value, str) and value.strip():
-            reasoning_parts.append(value.strip())
-    reasoning_str = "\n\n".join(reasoning_parts)
-
-    text_value = message.get("text")
-    text_str = text_value.strip() if isinstance(text_value, str) else ""
-
-    candidates = [s for s in (content_str, reasoning_str, text_str) if s]
-    if not candidates:
-        return ""
-
-    combined = "\n\n".join(candidates)
-    if _has_percentile_answer(combined) or _DATE_ANSWER_RE.search(combined):
-        extracted = _extract_percentile_lines(combined)
-        if _has_percentile_answer(extracted) or _DATE_ANSWER_RE.search(extracted):
-            return extracted
-
-    if _has_binary_answer(combined):
-        for candidate in (content_str, reasoning_str, text_str):
-            if candidate and _has_binary_answer(candidate):
-                return candidate
-
-    substantive = [s for s in candidates if len(s) >= 20]
-    if substantive:
-        return max(substantive, key=len)
-    return max(candidates, key=len)
-
-
-def _coerce_vultr_response_text(raw: str) -> str:
-    text = raw.strip()
-    if not text:
-        return text
-
-    if text.startswith("{") and ("reasoning" in text or '"content"' in text):
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            return text
-
-        if isinstance(payload, dict):
-            if "choices" in payload and payload["choices"]:
-                return _merge_assistant_message(payload["choices"][0])
-            if any(key in payload for key in ("content", "reasoning", "role", "message")):
-                return _merge_assistant_message(payload)
-
-    return text
-
-
-def _has_percentile_answer(text: str) -> bool:
-    return len(_PERCENTILE_ANSWER_RE.findall(text)) >= 4
-
-
-def _has_binary_answer(text: str) -> bool:
-    return bool(re.search(r"(?:[Pp]robability|[Pp]rediction)\s*[:=]?\s*\d+\s*%", text)) or bool(
-        re.findall(r"\d+\s*%", text)
-    )
-
-
-async def _finalize_forecast_text(
-    llm: Union[GeneralLlm, VultrLlm],
-    analysis_text: str,
-    answer_kind: Literal["percentiles", "binary", "dates"],
-    question_hint: str,
-) -> str:
-    text = _coerce_vultr_response_text(analysis_text)
-
-    if answer_kind == "percentiles" and _has_percentile_answer(text):
-        return _extract_percentile_lines(_strip_instruction_echo(text))
-    if answer_kind == "binary" and _has_binary_answer(text):
-        return text
-    if answer_kind == "dates" and re.search(
-        r"(?:[Pp]ercentile\s*)?(?:10|20|40|60|80|90)\s*[:=]\s*\d{4}-\d{2}-\d{2}", text
-    ):
-        return _extract_percentile_lines(text)
-
-    if answer_kind == "percentiles":
-        example = (
-            "Percentile 10: -2.5\n"
-            "Percentile 20: -1.0\n"
-            "Percentile 40: 0.5\n"
-            "Percentile 60: 1.5\n"
-            "Percentile 80: 3.0\n"
-            "Percentile 90: 5.0"
-        )
-    elif answer_kind == "dates":
-        example = (
-            "Percentile 10: 2026-07-15\n"
-            "Percentile 20: 2026-08-01\n"
-            "Percentile 40: 2026-09-01\n"
-            "Percentile 60: 2026-10-01\n"
-            "Percentile 80: 2026-11-01\n"
-            "Percentile 90: 2026-12-01"
-        )
-    else:
-        example = "Probability: 35%"
-
-    follow_up = (
-        "Using the prior analysis below, reply with exactly six forecast lines and "
-        "nothing else. No JSON, markdown, headings, or explanation.\n\n"
-        f"Example format:\n{example}\n\n"
-        f"Question: {question_hint}\n\n"
-        f"Prior analysis:\n{text[:5000]}"
-    )
-    finalized = _coerce_vultr_response_text(await llm.invoke(follow_up))
-    finalized = _extract_percentile_lines(_strip_instruction_echo(finalized))
-    if answer_kind == "percentiles" and _has_percentile_answer(finalized):
-        return finalized
-    if answer_kind == "binary" and _has_binary_answer(finalized):
-        return finalized
-    if answer_kind == "dates" and _DATE_ANSWER_RE.search(finalized):
-        return finalized
-
-    if answer_kind == "percentiles" and _has_percentile_answer(text):
-        return _extract_percentile_lines(text)
-    return finalized or _extract_percentile_lines(text) or text
-
-
-class VultrLlm(OutputsText, RetryableModel):
+class VultrLlm:
     def __init__(
         self,
         model: str,
@@ -486,29 +85,17 @@ class VultrLlm(OutputsText, RetryableModel):
         max_output_tokens: int = VULTR_MAX_OUTPUT_TOKENS,
         api_url: Optional[str] = None,
     ) -> None:
-        super().__init__(allowed_tries=max(1, allowed_tries))
-        self.model = _vultr_inference_model_id(model)
-        self.requested_model = model
+        self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        self.allowed_tries = allowed_tries
         self.max_output_tokens = max_output_tokens
         self.api_url = api_url or VULTR_API_URL
-
-    async def _mockable_direct_call_to_model(self, input: Any) -> str:
-        return await self.invoke(input)
-
-    @staticmethod
-    def _get_mock_return_for_direct_call_to_model_using_cheap_input() -> str:
-        return "mock vultr response"
-
-    @staticmethod
-    def _get_cheap_input_for_invoke() -> str:
-        return "test"
 
     async def invoke(self, prompt: str) -> str:
         if not VULTR_API_KEY:
             raise ValueError(
-                "VULTR_API_KEY is required for Vultr serverless inference."
+                "VULTR_SERVERLESS_INFERENCE_API_KEY is required for Vultr serverless inference."
             )
 
         headers = {
@@ -517,12 +104,9 @@ class VultrLlm(OutputsText, RetryableModel):
         }
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": _VULTR_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
+            "input": prompt,
             "temperature": self.temperature,
-            "max_tokens": self.max_output_tokens,
+            "max_output_tokens": self.max_output_tokens,
         }
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -551,32 +135,17 @@ class VultrLlm(OutputsText, RetryableModel):
             if isinstance(value, str):
                 return value
             if isinstance(value, dict):
-                merged = _merge_assistant_message(value)
-                if merged:
-                    return merged
-                for key in ("output", "result", "text", "content", "reasoning", "reasoning_content"):
+                for key in ("output", "result", "text", "content"):
                     if key in value:
                         extracted = _extract_text(value[key])
                         if extracted:
                             return extracted
-                return ""
+                return json.dumps(value)
             if isinstance(value, list):
-                for item in value:
-                    extracted = _extract_text(item)
-                    if extracted:
-                        return extracted
-                return ""
+                return " ".join(_extract_text(item) for item in value if item is not None)
             return str(value)
 
-        output = _coerce_vultr_response_text(
-            _extract_text(
-                data.get("choices")
-                or data.get("output")
-                or data.get("result")
-                or data.get("response")
-                or data.get("text")
-            )
-        )
+        output = _extract_text(data.get("output") or data.get("result") or data.get("choices") or data.get("response") or data.get("text"))
         if not output:
             raise ValueError(
                 "Vultr inference response did not include usable text output."
@@ -587,11 +156,11 @@ class VultrLlm(OutputsText, RetryableModel):
 MAX_COERCE_DEPTH = int(os.getenv("MAX_COERCE_DEPTH", "30"))
 
 AI_TOURNAMENT_ID = "33022"
-MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q3"
+MARKET_PULSE_TOURNAMENT_SLUG = "market-pulse-26q2"
 SPRING_2026_AI_BENCHMARKING_SLUG = "spring-aib-2026"
 
 _FALLBACK_FRACS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
-_FALLBACK_PERCENTILES = (10, 20, 40, 60, 80, 90)
+_FALLBACK_PERCENTILES = (0.1, 0.2, 0.4, 0.6, 0.8, 0.9)
 
 # No default routing toward 50%; forecasts should follow evidence.
 CALIBRATION_SCALE: float = float(os.getenv("CALIBRATION_SCALE", "1.00"))
@@ -619,6 +188,8 @@ SPRING_EXTREMIZE_LOW_THRESHOLD: float = float(os.getenv("SPRING_EXTREMIZE_LOW_TH
 SPRING_EXTREMIZE_LOW_FLOOR: float = float(os.getenv("SPRING_EXTREMIZE_LOW_FLOOR", "0.05"))
 
 RUN_LOG_PATH: str = os.getenv("RUN_LOG_PATH", "nike_bot_run_log.jsonl")
+
+_WS_RE = re.compile(r"\s+")
 
 # ---------------------------------------------------------------------------
 # Bound-coercion helpers
@@ -902,6 +473,71 @@ class PatchedMetaculusClient(MetaculusClient):
 # ---------------------------------------------------------------------------
 # Web-search helpers
 # ---------------------------------------------------------------------------
+async def _post_json_http(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    r = await client.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_S)
+    r.raise_for_status()
+    return r.json()
+
+
+async def linkup_search(
+    query: str, max_results: int = 8, depth: str = "deep"
+) -> List[Dict[str, Any]]:
+    """Query Linkup. Returns [] silently if API key is missing or call fails."""
+    if not LINKUP_API_KEY:
+        return []
+    headers = {
+        "Authorization": f"Bearer {LINKUP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "q": query,
+        "depth": depth,
+        "outputType": "searchResults",
+        "includeSources": False,
+        "includeImages": False,
+        "includeInlineCitations": False,
+        "maxResults": max_results,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            data = await _post_json_http(client, LINKUP_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+    except Exception as exc:
+        logger.warning("Linkup search failed (query=%r): %s", query[:60], exc)
+        return []
+
+
+async def exa_search(
+    query: str,
+    max_results: int = 8,
+    max_age_hours: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Query Exa. Returns [] silently if API key is missing or call fails."""
+    if not EXA_API_KEY:
+        return []
+    headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
+    payload: Dict[str, Any] = {
+        "query": query,
+        "numResults": max_results,
+        "type": "auto",
+        "useAutoprompt": True,
+        "contents": {"highlights": {"max_characters": 2000}},
+    }
+    if max_age_hours is not None:
+        payload["maxAgeHours"] = int(max_age_hours)
+    try:
+        async with httpx.AsyncClient() as client:
+            data = await _post_json_http(client, EXA_ENDPOINT, headers, payload)
+        return data.get("results", []) or []
+    except Exception as exc:
+        logger.warning("Exa search failed (query=%r): %s", query[:60], exc)
+        return []
+
 
 async def asknews_search(
     query: str,
@@ -910,60 +546,106 @@ async def asknews_search(
     """
     Query AskNews. Returns '' silently if credentials are missing or call fails.
 
-    Uses the AskNews SDK directly so we stay compatible with the installed
-    asknews package (forecasting-tools may pass unsupported kwargs like try_cache).
+    mode can be one of:
+      - "asknews/news-summaries"
+      - "asknews/deep-research/low-depth"
+      - "asknews/deep-research/medium-depth"
+      - "asknews/deep-research/high-depth"
     """
-    if mode != "asknews/news-summaries":
-        logger.warning(
-            "AskNews mode %s is not supported by the direct SDK wrapper; skipping",
-            mode,
-        )
-        return ""
     if not (ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET):
         return ""
     try:
-        from asknews_sdk import AsyncAskNewsSDK
-
-        async with AsyncAskNewsSDK(
-            client_id=ASKNEWS_CLIENT_ID,
-            client_secret=ASKNEWS_CLIENT_SECRET,
-            scopes={"news"},
-        ) as ask:
-            hot_response = await ask.news.search_news(
-                query=query,
-                n_articles=6,
-                return_type="both",
-                strategy="latest news",
-            )
-            historical_response = await ask.news.search_news(
-                query=query,
-                n_articles=10,
-                return_type="both",
-                strategy="news knowledge",
-            )
-
-        parts: List[str] = ["Here are the relevant news articles:\n"]
-        for label, response in (
-            ("Latest news", hot_response),
-            ("Recent context", historical_response),
-        ):
-            articles = getattr(response, "as_dicts", None) or []
-            if not articles:
-                continue
-            parts.append(f"\n## {label}\n")
-            for article in sorted(articles, key=lambda a: a.pub_date, reverse=True):
-                pub_date = article.pub_date.strftime("%B %d, %Y %I:%M %p")
-                parts.append(
-                    f"**{article.eng_title}**\n{article.summary}\n"
-                    f"Publish date: {pub_date}\n"
-                    f"Source: [{article.source_id}]({article.article_url})\n"
-                )
-
-        formatted = "\n".join(parts).strip()
-        return formatted if formatted else ""
+        result = await AskNewsSearcher().call_preconfigured_version(mode, query)
+        return result or ""
     except Exception as exc:
         logger.warning("AskNews search failed (mode=%s): %s", mode, exc)
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Source-ranking helpers
+# ---------------------------------------------------------------------------
+_HIGH_TRUST_DOMAINS = {
+    "reuters.com", "apnews.com", "ft.com", "wsj.com", "bloomberg.com",
+    "economist.com", "bbc.co.uk", "bbc.com", "theguardian.com", "nytimes.com",
+    "washingtonpost.com", "sec.gov", "federalregister.gov", "europa.eu",
+    "ec.europa.eu", "gov.uk", "who.int", "un.org", "worldbank.org", "imf.org",
+    "oecd.org", "arxiv.org", "nature.com", "science.org", "ieee.org", "acm.org",
+}
+_MED_TRUST_HINTS = (
+    "investor", "ir.", "investors.", "press", "newsroom", "docs.", "github.com"
+)
+_LOW_TRUST_HINTS = (
+    "pinterest.", "quora.", "medium.com", "substack.com", "blogspot.",
+    "wordpress.", "tumblr.", "tiktok.", "facebook.", "x.com", "twitter.com",
+)
+
+
+def _domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+
+def _score_source(url: str, title: str = "", snippet: str = "") -> float:
+    d = _domain_of(url)
+    if not d:
+        return 0.0
+    score = 0.0
+    if d in _HIGH_TRUST_DOMAINS:
+        score += 2.5
+    if d.endswith((".gov", ".edu", ".org")):
+        score += 1.7
+    if "github.com" in d:
+        score += 1.0
+    low = (title + " " + snippet).lower()
+    if any(h in d for h in _MED_TRUST_HINTS) or any(h in low for h in _MED_TRUST_HINTS):
+        score += 0.6
+    if any(h in d for h in _LOW_TRUST_HINTS):
+        score -= 1.0
+    if len(snippet.strip()) < 120:
+        score -= 0.2
+    return score
+
+
+def _rank_and_format_sources(
+    items: List[Dict[str, Any]], max_to_keep: int = 14
+) -> tuple[str, List[str]]:
+    scored: List[tuple[float, str, str, str]] = []
+    for it in items:
+        url = (it.get("url") or "").strip()
+        if not url:
+            continue
+        title = (it.get("title") or it.get("name") or "").strip()
+        text = ""
+        if isinstance(it.get("highlights"), list) and it["highlights"]:
+            text = str(it["highlights"][0])
+        else:
+            text = (it.get("content") or it.get("text") or "").strip()
+        snippet = _WS_RE.sub(" ", text)[:420]
+        scored.append(
+            (_score_source(url, title=title, snippet=snippet), url, title, snippet)
+        )
+
+    best_by_url: Dict[str, tuple[float, str, str]] = {}
+    for score, url, title, snippet in scored:
+        cur = best_by_url.get(url)
+        if cur is None or score > cur[0]:
+            best_by_url[url] = (score, title, snippet)
+
+    ranked = sorted(
+        ((s, u, t, sn) for u, (s, t, sn) in best_by_url.items()), reverse=True
+    )
+    bullets: List[str] = []
+    urls: List[str] = []
+    for score, url, title, snippet in ranked[:max_to_keep]:
+        label = title if title else url
+        bullets.append(f"- [{score:+.2f}] {label}: {snippet} ({url})")
+        urls.append(url)
+    return ("\n".join(bullets) if bullets else "(no sources retrieved)"), urls
 
 
 # ---------------------------------------------------------------------------
@@ -1083,36 +765,39 @@ _run_logger = RunLogger(RUN_LOG_PATH)
 # ---------------------------------------------------------------------------
 
 async def _compress_reasoning(
-    llm: Union[GeneralLlm, VultrLlm],
+    llm: GeneralLlm,
     full_reasoning: str,
     question_text: str,
     final_prediction_str: str,
 ) -> str:
-    source = _strip_instruction_echo(full_reasoning[:3000])
     prompt = clean_indents(
         f"""
-        Summarize this forecast in 2-3 first-person sentences for a Metaculus comment.
+        You are editing a forecaster's reasoning note for a public comment.
 
         Question: {question_text}
-        Prediction: {final_prediction_str}
-        Notes: {source}
+        Final prediction: {final_prediction_str}
 
-        Sentence 1: strongest supporting evidence.
-        Sentence 2: main remaining risk.
-        Sentence 3: conclusion and confidence.
+        Full reasoning:
+        {full_reasoning[:3000]}
 
-        Output only those sentences. No lists, headers, or meta-commentary.
+        Write exactly 2-3 sentences in first person that:
+        1. State the strongest evidence that supports the forecast.
+        2. Briefly name the main remaining risk.
+        3. State the conclusion and confidence clearly.
+
+        Rules:
+        - Use first person (I / I'm) and be direct.
+        - Do not describe the research process, tools, or strategy.
+        - No model names, no tool names, no "my research assistant says".
+        - No hedging phrases like "it's hard to say" or "I could be wrong".
+        - No bullet points, headers, or markdown.
+        - Start with evidence or the conclusion, not with "The question asks...".
         """
     )
     try:
-        compressed = _strip_instruction_echo(
-            _coerce_vultr_response_text(await llm.invoke(prompt))
-        )
+        compressed = await llm.invoke(prompt)
         lines = [l.strip() for l in compressed.strip().splitlines() if l.strip()]
-        summary = " ".join(lines[:3])
-        if summary and not summary.lower().startswith(("the user", "must ", "no ")):
-            return summary
-        return source[:300]
+        return " ".join(lines[:5])
     except Exception as exc:
         logger.warning("Reasoning compression failed: %s", exc)
         return full_reasoning.strip()[:300]
@@ -1127,18 +812,56 @@ async def _multi_source_research(
     summarizer_llm: GeneralLlm,
 ) -> str:
     """
-    Fetch AskNews summaries for the question. Returns a synthesised briefing
-    from AskNews when credentials are configured; otherwise falls back to LLM priors.
+    Fan out to Exa, Linkup, and AskNews in parallel. Each source is optional —
+    missing API keys cause silent skips. All available results are merged,
+    ranked, and summarised. The final block clearly labels which sources
+    contributed so the downstream LLM knows how fresh the data is.
+
+    This is intentionally additive: callers can layer additional context on top.
     """
     q = question.question_text.strip()
     criteria = (question.resolution_criteria or "").strip()
+    query_resolution = f"{q}\nResolution criteria:\n{criteria[:600]}"
+    query_criteria_only = criteria[:700] if criteria else q
 
     today = datetime.now().strftime("%Y-%m-%d")
 
-    asknews_result = await asknews_search(q, mode="asknews/news-summaries")
-    asknews_text: str = asknews_result if isinstance(asknews_result, str) else ""
+    # ── Fan out all sources simultaneously ──────────────────────────────────
+    (
+        exa_1, exa_2, exa_3,
+        lk_1, lk_2,
+        asknews_result,
+    ) = await asyncio.gather(
+        exa_search(q, max_results=10),
+        exa_search(query_resolution, max_results=8),
+        exa_search(query_criteria_only, max_results=6),
+        linkup_search(q, max_results=8, depth="deep"),
+        linkup_search(query_resolution, max_results=6, depth="deep"),
+        asknews_search(q, mode="asknews/news-summaries"),
+        return_exceptions=True,
+    )
+
+    # Normalise exceptions to empty
+    def _safe_list(v: Any) -> List[Dict[str, Any]]:
+        return v if isinstance(v, list) else []
+
+    def _safe_str(v: Any) -> str:
+        return v if isinstance(v, str) else ""
+
+    structured_results: List[Dict[str, Any]] = [
+        *_safe_list(exa_1),
+        *_safe_list(exa_2),
+        *_safe_list(exa_3),
+        *_safe_list(lk_1),
+        *_safe_list(lk_2),
+    ]
+    asknews_text: str = _safe_str(asknews_result)
 
     sources_active: List[str] = []
+    if any(_safe_list(r) for r in (exa_1, exa_2, exa_3)):
+        sources_active.append("Exa")
+    if any(_safe_list(r) for r in (lk_1, lk_2)):
+        sources_active.append("Linkup")
     if asknews_text:
         sources_active.append("AskNews")
 
@@ -1146,10 +869,15 @@ async def _multi_source_research(
         ", ".join(sources_active) if sources_active else "none (no API keys configured)"
     )
     logger.info(
-        "Research for %s — active sources: %s",
+        "Multi-source research for %s — active sources: %s",
         question.page_url, sources_label,
     )
 
+    # ── Rank and format structured snippets ─────────────────────────────────
+    sources_block, urls = _rank_and_format_sources(structured_results, max_to_keep=14)
+    url_list = "\n".join(urls[:30]) if urls else "(none)"
+
+    # ── Build AskNews section ────────────────────────────────────────────────
     asknews_section = ""
     if asknews_text:
         asknews_section = clean_indents(
@@ -1159,59 +887,56 @@ async def _multi_source_research(
             """
         )
 
-    if asknews_text:
-        synthesise_prompt = clean_indents(
-            f"""
-            You are a research assistant to a professional superforecaster.
-            Today's date: {today}.
+    # ── Synthesise with summariser LLM ──────────────────────────────────────
+    synthesise_prompt = clean_indents(
+        f"""
+        You are a research assistant to a professional superforecaster.
+        Today's date: {today}.
 
-            Your job: produce a concise, decision-relevant briefing that helps the
-            forecaster make a well-calibrated probability estimate. Do NOT produce
-            a final forecast yourself. Do NOT invent facts. Only state what the
-            retrieved evidence says.
+        Your job: produce a concise, decision-relevant briefing that helps the
+        forecaster make a well-calibrated probability estimate. Do NOT produce
+        a final forecast yourself. Do NOT invent facts. Only state what the
+        retrieved evidence says.
 
-            Question:
-            {q}
+        Question:
+        {q}
 
-            Resolution criteria:
-            {criteria}
+        Resolution criteria:
+        {criteria}
 
-            {asknews_section}
+        === STRUCTURED WEB SNIPPETS (ranked by source credibility) ===
+        {sources_block}
 
-            Output format (use these exact headers):
-            ## Key facts
-            (4-6 bullets of the most decision-relevant facts from the sources above)
+        {asknews_section}
 
-            ## YES scenario
-            (What evidence / conditions would lead to a YES resolution)
+        Output format (use these exact headers):
+        ## Key facts
+        (4-6 bullets of the most decision-relevant facts from the sources above)
 
-            ## NO scenario
-            (What evidence / conditions would lead to a NO resolution)
+        ## YES scenario
+        (What evidence / conditions would lead to a YES resolution)
 
-            ## Timeline signal
-            (Most important near-term event or data point that would shift the answer)
+        ## NO scenario
+        (What evidence / conditions would lead to a NO resolution)
 
-            ## Recency note
-            (State the date range of the evidence you found and flag any gaps)
-            """
-        )
-        try:
-            summary = await summarizer_llm.invoke(synthesise_prompt)
-        except Exception as exc:
-            logger.warning("Synthesis LLM failed for %s: %s", question.page_url, exc)
-            summary = f"(Synthesis failed: {exc})\n\n{asknews_section}"
-    else:
-        summary = clean_indents(
-            f"""
-            No live research sources were available for this question.
-            The forecaster should rely on question background and resolution criteria only.
+        ## Timeline signal
+        (Most important near-term event or data point that would shift the answer)
 
-            Question:
-            {q}
+        ## Recency note
+        (State the date range of the evidence you found and flag any gaps)
 
-            Resolution criteria:
-            {criteria}
-            """
+        ## Sources
+        {url_list}
+        """
+    )
+
+    try:
+        summary = await summarizer_llm.invoke(synthesise_prompt)
+    except Exception as exc:
+        logger.warning("Synthesis LLM failed for %s: %s", question.page_url, exc)
+        summary = (
+            f"(Synthesis failed: {exc})\n\n"
+            f"Raw snippets:\n{sources_block}\n\n{asknews_section}"
         )
 
     return clean_indents(
@@ -1233,10 +958,18 @@ class NikeBot(ForecastBot):
     """
     Nike Bot — Evidence-first forecast mode.
 
-    Research strategy (optional via API keys):
+    Research strategy (all sources additive and optional via API keys):
+      • Exa         — semantic web search, high recall
+      • Linkup      — deep web crawl with highlighted snippets
       • AskNews     — curated news summaries with freshness scores
+    All three run in parallel; missing keys are silently skipped so the bot
+    always runs even with zero third-party keys (falls back to LLM priors only,
+    which is the worst case and clearly flagged in the research block).
 
     Forecast model: Vultr serverless inference model by default.
+    Every forecast prompt includes the full research block so the model's
+    knowledge cutoff cannot silently contaminate the answer — the research
+    always carries a retrieval date.
     """
 
     _max_concurrent_questions: int = 1
@@ -1244,38 +977,10 @@ class NikeBot(ForecastBot):
     def __init__(self, *args: Any, dry_run: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._concurrency_limiter = asyncio.Semaphore(self._max_concurrent_questions)
-        self._structure_output_validation_samples = 1
+        self._structure_output_validation_samples = 2
         self.dry_run = dry_run
         self._question_cache = QuestionCache()
         self._binary_preds_this_question: List[float] = []
-
-    def get_llm(
-        self,
-        purpose: str = "default",
-        guarantee_type: Optional[Literal["llm", "string_name"]] = None,
-    ) -> Union[GeneralLlm, VultrLlm, str]:
-        """
-        forecasting-tools wraps non-GeneralLlm values in GeneralLlm(model=...), which
-        breaks custom providers like VultrLlm. Return VultrLlm instances as-is.
-        """
-        if purpose not in self._llms:
-            raise ValueError(
-                f"Unknown llm requested from llm dict for purpose: '{purpose}'"
-            )
-
-        llm = self._llms[purpose]
-        if llm is None:
-            raise ValueError(
-                f"LLM is undefined for purpose: {purpose}. It was probably not defined in defaults."
-            )
-
-        if isinstance(llm, VultrLlm):
-            if guarantee_type is None or guarantee_type == "llm":
-                return llm
-            if guarantee_type == "string_name":
-                return llm.model
-
-        return super().get_llm(purpose, guarantee_type)
 
     # -------------------------------------------------------------------------
     # Retry addendum builder
@@ -1320,7 +1025,7 @@ class NikeBot(ForecastBot):
     # -------------------------------------------------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            # ── 1. AskNews research ───────────────────────────────────────────
+            # ── 1. Multi-source live research (Exa + Linkup + AskNews) ──────
             live_research = await _multi_source_research(
                 question,
                 self.get_llm("summarizer", "llm"),
@@ -1357,9 +1062,6 @@ class NikeBot(ForecastBot):
         Returns '' if no researcher key is configured or the call fails.
         This is additive — it supplements, not replaces, the multi-source research.
         """
-        if "researcher" not in self._llms:
-            return ""
-
         researcher = self.get_llm("researcher")
         if researcher is None:
             return ""
@@ -1383,7 +1085,7 @@ class NikeBot(ForecastBot):
         )
 
         try:
-            if isinstance(researcher, (GeneralLlm, VultrLlm)):
+            if isinstance(researcher, GeneralLlm):
                 return await researcher.invoke(prompt)
 
             if isinstance(researcher, str):
@@ -1412,6 +1114,15 @@ class NikeBot(ForecastBot):
                     )
                     return await searcher.invoke(prompt)
 
+                if researcher == "linkup":
+                    return await self._linkup_research(question)
+
+                if researcher == "exa":
+                    return await self._exa_research(question)
+
+                if researcher == "linkup+exa":
+                    return await self._linkup_exa_research(question)
+
                 if researcher in ("", "None", "no_research"):
                     return ""
 
@@ -1419,6 +1130,141 @@ class NikeBot(ForecastBot):
             logger.warning("Extra researcher failed for %s: %s", question.page_url, exc)
 
         return ""
+
+    async def _linkup_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
+
+        linkup_1, linkup_2 = await asyncio.gather(
+            linkup_search(q, max_results=8, depth="deep"),
+            linkup_search(query_resolution, max_results=6, depth="deep"),
+        )
+        combined: List[Dict[str, Any]] = [*(linkup_1 or []), *(linkup_2 or [])]
+        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
+
+        summarize_prompt = clean_indents(
+            f"""
+            You are a research assistant to a superforecaster.
+            Task: produce a concise, decision-relevant briefing grounded in the retrieved
+            sources. Do NOT produce a final forecast. Do NOT invent facts.
+
+            Question: {q}
+            Resolution criteria: {criteria}
+
+            Retrieved web snippets (ranked; each includes a URL):
+            {sources_block}
+
+            Output format:
+            1) Key facts (4-5 bullets max)
+            2) What would make this resolve YES vs NO (brief)
+            3) Timeline / what's likely before resolution (brief)
+            4) Source list (just the URLs, one per line)
+            """
+        )
+        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
+        url_list = "\n".join(urls[:20]) if urls else ""
+        return clean_indents(
+            f"""
+            {summary}
+
+            --- LINKUP SOURCES (ranked URLs) ---
+            {url_list}
+            """
+        ).strip()
+
+    async def _exa_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
+        query_criteria_only = criteria[:700] if criteria else q
+
+        exa_1, exa_2, exa_3 = await asyncio.gather(
+            exa_search(q, max_results=10),
+            exa_search(query_resolution, max_results=8),
+            exa_search(query_criteria_only, max_results=6),
+        )
+        combined: List[Dict[str, Any]] = [*(exa_1 or []), *(exa_2 or []), *(exa_3 or [])]
+        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=10)
+
+        summarize_prompt = clean_indents(
+            f"""
+            You are a research assistant to a superforecaster.
+            Task: produce a concise, decision-relevant briefing grounded in the retrieved
+            sources. Do NOT produce a final forecast. Do NOT invent facts.
+
+            Question: {q}
+            Resolution criteria: {criteria}
+
+            Retrieved web snippets (ranked; each includes a URL):
+            {sources_block}
+
+            Output format:
+            1) Key facts (4-5 bullets max)
+            2) What would make this resolve YES vs NO (brief)
+            3) Timeline / what's likely before resolution (brief)
+            4) Source list (just the URLs, one per line)
+            """
+        )
+        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
+        url_list = "\n".join(urls[:20]) if urls else ""
+        return clean_indents(
+            f"""
+            {summary}
+
+            --- EXA SOURCES (ranked URLs) ---
+            {url_list}
+            """
+        ).strip()
+
+    async def _linkup_exa_research(self, question: MetaculusQuestion) -> str:
+        q = question.question_text.strip()
+        criteria = (question.resolution_criteria or "").strip()
+        query_resolution = f"{q}\nResolution criteria keywords:\n{criteria[:600]}"
+        query_criteria_only = criteria[:700] if criteria else q
+
+        linkup_1, linkup_2, exa_1, exa_2, exa_3 = await asyncio.gather(
+            linkup_search(q, max_results=8, depth="deep"),
+            linkup_search(query_resolution, max_results=6, depth="deep"),
+            exa_search(q, max_results=10),
+            exa_search(query_resolution, max_results=8),
+            exa_search(query_criteria_only, max_results=6),
+        )
+        combined: List[Dict[str, Any]] = [
+            *(linkup_1 or []), *(linkup_2 or []),
+            *(exa_1 or []), *(exa_2 or []), *(exa_3 or []),
+        ]
+        sources_block, urls = _rank_and_format_sources(combined, max_to_keep=14)
+
+        summarize_prompt = clean_indents(
+            f"""
+            You are a research assistant to a superforecaster.
+            Task: produce a concise, decision-relevant briefing grounded in the retrieved
+            sources. Do NOT produce a final forecast. Do NOT invent facts.
+
+            Question: {q}
+            Resolution criteria: {criteria}
+
+            Retrieved web snippets (ranked; each includes a URL):
+            {sources_block}
+
+            Output format:
+            1) Key facts (6 bullets max)
+            2) What would make this resolve YES vs NO (brief)
+            3) Timeline / what's likely before resolution (brief)
+            4) Source list (just the URLs, one per line)
+            """
+        )
+        summary = await self.get_llm("summarizer", "llm").invoke(summarize_prompt)
+        url_list = "\n".join(urls[:30]) if urls else ""
+        return clean_indents(
+            f"""
+            {summary}
+
+            --- SOURCES (ranked URLs) ---
+            {url_list}
+            """
+        ).strip()
 
     # -------------------------------------------------------------------------
     # Binary questions
@@ -1482,12 +1328,6 @@ class NikeBot(ForecastBot):
         self, question: BinaryQuestion, prompt: str
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        reasoning = await _finalize_forecast_text(
-            self.get_llm("default", "llm"),
-            reasoning,
-            "binary",
-            question.question_text,
-        )
         logger.info("Reasoning for %s: %s", question.page_url, reasoning)
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
@@ -1742,22 +1582,29 @@ class NikeBot(ForecastBot):
         for attempt in range(max_retries):
             try:
                 reasoning = await self.get_llm("default", "llm").invoke(prompt)
-                reasoning = await _finalize_forecast_text(
-                    self.get_llm("default", "llm"),
-                    reasoning,
-                    "percentiles",
-                    question.question_text,
-                )
                 logger.info(
                     "Numeric reasoning for %s (attempt %d): %s",
                     question.page_url, attempt + 1, reasoning,
                 )
 
-                percentile_list = await _parse_percentiles_with_fallback(
+                parsing_instructions = clean_indents(
+                    f"""
+                    The text is a forecast distribution for a numeric question.
+                    Question: "{question.question_text}"
+                    Units: {question.unit_of_measure}
+                    Bounds: {question.lower_bound} – {question.upper_bound} {question.unit_of_measure}
+                    - Parse values in the correct units.
+                    - No scientific notation.
+                    - NEVER return values outside [{question.lower_bound}, {question.upper_bound}].
+                    """
+                )
+
+                percentile_list: List[Percentile] = await structure_output(
                     reasoning,
-                    question,
-                    self.get_llm("parser", "llm"),
-                    self._structure_output_validation_samples,
+                    list[Percentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
                 )
 
                 percentile_list = _sort_percentiles_monotone(percentile_list)
@@ -1802,10 +1649,10 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except (AssertionError, ValueError, ValidationError) as exc:
+            except AssertionError as exc:
                 last_error = exc
                 logger.warning(
-                    "Numeric parse failed on attempt %d for %s: %s",
+                    "AssertionError on numeric attempt %d for %s: %s",
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
@@ -1933,22 +1780,29 @@ class NikeBot(ForecastBot):
         for attempt in range(max_retries):
             try:
                 reasoning = await self.get_llm("default", "llm").invoke(prompt)
-                reasoning = await _finalize_forecast_text(
-                    self.get_llm("default", "llm"),
-                    reasoning,
-                    "dates",
-                    question.question_text,
-                )
                 logger.info(
                     "Date reasoning for %s (attempt %d): %s",
                     question.page_url, attempt + 1, reasoning,
                 )
 
-                date_percentile_list = await _parse_date_percentiles_with_fallback(
+                parsing_instructions = clean_indents(
+                    f"""
+                    The text is a forecast distribution for a date question.
+                    Question: "{question.question_text}"
+                    Bounds: {question.lower_bound.date().isoformat()} to
+                            {question.upper_bound.date().isoformat()}
+                    - Format each date as a valid parseable datetime string.
+                    - Assume midnight UTC if no time is given.
+                    - All dates MUST fall within the stated bounds.
+                    """
+                )
+
+                date_percentile_list: List[DatePercentile] = await structure_output(
                     reasoning,
-                    question,
-                    self.get_llm("parser", "llm"),
-                    self._structure_output_validation_samples,
+                    list[DatePercentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=parsing_instructions,
+                    num_validation_samples=self._structure_output_validation_samples,
                 )
 
                 clipped, was_clipped = self._clip_date_percentiles(
@@ -1992,10 +1846,10 @@ class NikeBot(ForecastBot):
                     prediction_value=prediction, reasoning=compressed
                 )
 
-            except (AssertionError, ValueError, ValidationError) as exc:
+            except AssertionError as exc:
                 last_error = exc
                 logger.warning(
-                    "Date parse failed on attempt %d for %s: %s",
+                    "AssertionError on date attempt %d for %s: %s",
                     attempt + 1, question.page_url, exc,
                 )
                 if attempt < max_retries - 1:
@@ -2226,6 +2080,10 @@ class NikeBot(ForecastBot):
 # ---------------------------------------------------------------------------
 def _log_startup_banner(mode: str, dry_run: bool) -> None:
     sources: List[str] = []
+    if EXA_API_KEY:
+        sources.append("Exa")
+    if LINKUP_API_KEY:
+        sources.append("Linkup")
     if ASKNEWS_CLIENT_ID and ASKNEWS_CLIENT_SECRET:
         sources.append("AskNews")
     sources_str = ", ".join(sources) if sources else "none (LLM priors only)"
@@ -2360,7 +2218,6 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
-        enable_summarize_research=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=False,
@@ -2391,14 +2248,13 @@ if __name__ == "__main__":
                 allowed_tries=2,
                 max_output_tokens=VULTR_MAX_OUTPUT_TOKENS,
             ),
-            # NikeBot already runs multi-source research; disable framework default.
-            "researcher": "no_research",
             # ── Optional extra researcher ─────────────────────────────────────
-            # The AskNews research pipeline always runs first.
+            # The multi-source engine (Exa + Linkup + AskNews) always runs first.
             # Uncomment ONE of the lines below to add an extra research pass on
             # top of the base sources. Leave all commented out if not needed.
             #
             # "researcher": "asknews/deep-research/medium-depth",
+            # "researcher": "linkup+exa",
         },
     )
 
